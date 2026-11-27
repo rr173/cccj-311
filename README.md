@@ -69,6 +69,7 @@ python3 -m pytest -q
 | GET  | `/events/{id}/my-bids` | 买家 | 自己的出价与成交情况 |
 | POST | `/events/{id}/close` | 管理员 | 结整场（逐件结标） |
 | GET  | `/me` | 任意登录用户 | 当前身份 |
+| 领货/交割 | `/events/{id}/pickups/*`、`/deliveries`、`/receipts` | 赢家/承运人/司机/卖家 | 详见下文「成交后现场领货 / 交割」 |
 
 错误统一返回：
 
@@ -78,22 +79,106 @@ python3 -m pytest -q
 
 常用错误码：`budget_required`、`budget_exceeded`、`budget_below_commitment`、`below_reserve`、`must_raise`、`lot_closed`、`event_closed`、`reserve_locked`、`forbidden`、`invalid_token`。
 
+## 成交后现场领货 / 交割（Pickup & Delivery）
+
+只适用于**已成交**（结标且有赢家）的标的；**整场活动关闭后仍可委托、派司机、交货与查回执**。交割流程不修改赢家、成交价或预算，也不接入任何支付或外部物流。
+
+### 角色与“当前可实际领货人”
+
+受托方就是同场已注册的账号（可用既有 `buyer/seller` 账号，也可注册 `carrier/driver` 角色）。对某件标的，同一时刻只有一个可实际领货的人：
+
+1. 有有效司机 → **司机**；
+2. 否则有承运人 → **承运人**；
+3. 都没有 → **赢家本人**。
+
+委托/指派目标必须是同活动已有账号，且对该件不能是：该件卖家、该件赢家、操作人自己。
+
+- 买家（赢家）对自己**尚未交付**的拍品批量**委托 / 改派 / 收回**承运人。重新委托（即使还是同一承运人）会清空旧司机并作废旧凭据；只影响所选拍品。
+- 承运人对自己**当前受托且未交付**的拍品批量**指派 / 更换 / 撤回**司机。
+- **收回必须存在当前承运人委托；撤回司机必须存在当前司机指派**。批量中任一件不满足（不存在、非本人权利、未成交、已交付、缺少对应委托等），**整批不变**（单事务校验后写入）。
+- 已交付拍品不能再委托、改派、收回或更换/撤回司机。
+
+### 核验凭据
+
+每件未交付拍品的“当前授权”对应一枚稳定的不透明凭据 `pck_...`（HMAC 绑定 活动/拍品/授权版本/当前领货人，密钥持久化在 `meta` 表，重启不变）。赢家、该件卖家、当前承运人/司机登录后可在状态响应中直接取得，也可单独调凭据接口。
+
+任何授权变更都会把该件 `auth_version + 1`，因此**旧凭据立即失效——即使新授权恰好是同一个领货人**；其他未变更拍品的凭据不受影响。交付后不再签发凭据。
+
+### 卖家一次交货 + 幂等请求号
+
+卖家交货时提交：**领货账号**（`id`/数字 id/用户名均可）、**一组互不重复的拍品**、**逐件凭据**、以及该次交付的 **请求号 `request_id`**（也可用 `Idempotency-Key` 请求头）。
+
+- 所有拍品在同一事务内校验：均属于该卖家、已成交、未交付、凭据为当前授权有效凭据、且当前授权领货人都是所提交的同一账号。任一件过期/已交付/不属于该卖家/领货人不符 → **整组拒绝，不写任何状态**。
+- 通过后生成**一份回执**（一个回执号，含全部拍品与每件“确认时”的赢家/承运人/司机/实际领货人快照及交付时间）。
+- 同一 `(活动, 卖家, request_id)` 重送**相同内容**（拍品顺序不限，按拍品 id 规范化哈希）→ 返回**原回执**（资源型路由首次 `201`、重放 `200`，带 `replayed:true`）。
+- 同一 `request_id` 但内容不同 → `409 idempotency_conflict`。不同卖家可复用同一请求号。
+- 交付与改派/收回竞争时，所有操作都在进程锁 + `BEGIN IMMEDIATE` 事务内串行：变更先提交则旧凭据失效导致交货失败；交货先提交则后续变更以 `already_delivered` 拒绝。不会出现按变更前后两套授权同时交货。
+
+### 回执可见性
+
+- **卖家**与**实际领货人**（实际到现场的司机，或未派司机时的承运人/赢家）可见整份回执与全部明细。
+- **对应赢家**可见回执，但同一回执含多个赢家时，**只返回该赢家自己拍品的明细、`lot_ids` 与委托快照**。
+- 其他人（含未涉及的买家）对**已存在**的回执得到 `403 forbidden`；回执号不存在或不属于该活动才是 `404`。
+
+### 主要接口（规范路径）
+
+| 方法 | 路径 | 身份 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/events/{id}/lots/{lot}/pickup` | 赢家/卖家/当前承运人或司机 | 交割状态、当前授权、（未交付）凭据 |
+| GET/POST | `/events/{id}/lots/{lot}/credential` | 同上 | 取得当前授权凭据 |
+| POST | `/events/{id}/pickups/delegate` | 赢家 | 批量委托/改派承运人 `{"lot_ids":[...],"carrier_id":..}` |
+| POST | `/events/{id}/pickups/revoke` | 赢家 | 批量收回（须均有当前委托） |
+| POST | `/events/{id}/pickups/assign-driver` | 当前承运人 | 批量指派/更换司机 `{"lot_ids":[...],"driver_id":..}` |
+| POST | `/events/{id}/pickups/revoke-driver` | 当前承运人 | 批量撤回司机（须均有司机） |
+| POST | `/events/{id}/deliveries` | 该批拍品卖家 | 交货确认（资源型，首次 201/重放 200） |
+| POST | `/events/{id}/deliver` | 该批拍品卖家 | 同上（动作型，成功/重放均 200） |
+| GET | `/events/{id}/receipts` | 任意相关人 | 自己可见的回执列表（赢家视图自动裁剪） |
+| GET | `/events/{id}/receipts/{rid}` | 卖家/赢家/实际领货人 | 单份回执（赢家只看自己明细） |
+| GET | `/events/{id}/lots/{lot}/receipt` | 同上 | 按拍品查回执 |
+| GET | `/events/{id}/pickups` | 任意登录用户 | 与我相关的领货状态（`?as=winner|carrier|driver|seller&status=pending|delivered`） |
+
+交货请求示例：
+
+```json
+{
+  "request_id": "seller-a-20261127-01",
+  "picker_id": 7,
+  "items": [
+    {"lot_id": 11, "credential": "pck_...."},
+    {"lot_id": 12, "credential": "pck_...."}
+  ]
+}
+```
+
+也兼容扁平形式 `{"request_id":"...","picker":"driver_name","lot_ids":[11,12],"credentials":["...","..."]}`。
+
+为适配不同命名习惯，同一操作还挂载了大量别名（均经过同样的严格规则）：`/pickups/reassign|recover|withdraw`、`/delegations[...]`、`/driver-assignments[...]`、`/carrier/(assign|replace|revoke|withdraw)-driver`、`/deliveries`、`/handovers`、`/receipts`、`/vouchers`、`/lots/{lot}/(delivery|handover|authorization|...)`、单件 `POST /lots/{lot}/delegate|assign-driver|deliver`、以及 RPC 风格 `POST /events/{id}/pickup`，body 带 `"action":"delegate|revoke|assign_driver|revoke_driver|deliver"`。账号字段兼容 `carrier(_id|_account|_user)?`、`trustee(_id)?`、`driver(_id|_account)?`、`picker(_id)?`、`pickup_account`、`receiver`、`account`、`username` 等；凭据字段兼容 `credential|code|pickup_code|verification_code|token` 等。
+
+### 隐私与持久化
+
+- 公开接口 `GET /events/{id}`、`/lots`、`/lots/{lot}` 的响应结构**未加入**任何交割字段，不泄露凭据、承运人或司机身份。
+- 新表 `pickup_auth / deliveries / delivery_items` 与拍卖数据在同一个 SQLite 文件；`delivery_items.lot_id UNIQUE` 是防重复交付的硬约束。重启后授权、回执、凭据（同一 HMAC 密钥）均保留。旧库的 `users` 角色 CHECK 会在启动时无损迁移以支持 `carrier/driver` 角色。
+
 ## 代码结构
 
 ```
 app/
-  domain.py   纯规则：领先者、当前价、预算占用（无 DB / 无 HTTP）
-  db.py       SQLite schema、连接、串行化写事务
-  service.py  业务编排（校验、状态迁移、审计日志）
-  main.py     FastAPI 路由工厂 create_app()
-  models.py   Pydantic 请求/响应模型（金额字段 strict int）
-  errors.py   ApiError → {"error": {...}}
+  domain.py        纯规则：领先者、当前价、预算占用（无 DB / 无 HTTP）
+  db.py            SQLite schema、连接、串行化写事务、角色约束迁移
+  service.py       业务编排（校验、状态迁移、审计日志），继承 PickupMixin
+  pickups.py       领货/交割规则、凭据 HMAC、幂等哈希、回执与批量事务
+  pickup_routes.py 领货/交割 HTTP 路由 + 多命名别名与宽松字段解析
+  main.py          FastAPI 路由工厂 create_app()
+  models.py        Pydantic 请求/响应模型（金额字段 strict int）
+  errors.py        ApiError → {"error": {...}}
 tests/
-  test_domain.py            规则单元测试
-  test_api.py               端到端 API
-  test_edges.py             边界与隐私
-  test_concurrency.py       线程级并发 / 双连接同文件
-  test_http_concurrency.py  真实 uvicorn 并行请求
+  test_domain.py              规则单元测试
+  test_api.py                 端到端 API
+  test_edges.py               边界与隐私
+  test_concurrency.py         线程级并发 / 双连接同文件
+  test_http_concurrency.py    真实 uvicorn 并行请求
+  test_pickup_delivery.py     领货/承运人/司机/交货/回执/重启/并发
+  test_pickup_http_concurrency.py  交货 vs 改派的真实 HTTP 竞争
 ```
 
 ## 已知取舍

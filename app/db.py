@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS users (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id   INTEGER NOT NULL REFERENCES events(id),
     name       TEXT    NOT NULL,
-    role       TEXT    NOT NULL CHECK (role IN ('buyer', 'seller', 'admin')),
+    role       TEXT    NOT NULL CHECK (role IN ('buyer', 'seller', 'admin',
+                                                'carrier', 'driver')),
     token_hash TEXT    NOT NULL UNIQUE,
     budget     INTEGER CHECK (budget IS NULL OR budget >= 0),
     created_at TEXT    NOT NULL,
@@ -89,7 +90,75 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail     TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- Post-sale pickup / handover ("交割 / 领货")
+--
+-- One authorization row per SOLD lot.  The effective person who can physically
+-- collect the lot is: driver_id when set, otherwise carrier_id when set,
+-- otherwise the winner.  Every authorization change bumps auth_version, which
+-- invalidates all credentials derived for earlier authorizations -- even when
+-- the new authorization names the same physical picker.
+CREATE TABLE IF NOT EXISTS pickup_auth (
+    event_id     INTEGER NOT NULL REFERENCES events(id),
+    lot_id       INTEGER PRIMARY KEY REFERENCES lots(id),
+    winner_id    INTEGER NOT NULL REFERENCES users(id),
+    carrier_id   INTEGER REFERENCES users(id),
+    driver_id    INTEGER REFERENCES users(id),
+    auth_version INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT    NOT NULL,
+    updated_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pickup_auth_carrier ON pickup_auth(carrier_id);
+CREATE INDEX IF NOT EXISTS idx_pickup_auth_driver ON pickup_auth(driver_id);
+CREATE INDEX IF NOT EXISTS idx_pickup_auth_winner ON pickup_auth(winner_id);
+
+-- One confirmed handover per seller request id (idempotency boundary).
+CREATE TABLE IF NOT EXISTS deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id     INTEGER NOT NULL REFERENCES events(id),
+    seller_id    INTEGER NOT NULL REFERENCES users(id),
+    receipt_no   TEXT    NOT NULL,
+    picker_id    INTEGER NOT NULL REFERENCES users(id),
+    request_key  TEXT    NOT NULL,
+    request_hash TEXT    NOT NULL,
+    item_count   INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL,
+    UNIQUE(event_id, seller_id, request_key)
+);
+
+-- Every delivered lot appears exactly once: the UNIQUE(lot_id) is the hard
+-- guard against a lot being delivered twice, even across racing processes.
+CREATE TABLE IF NOT EXISTS delivery_items (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id  INTEGER NOT NULL REFERENCES deliveries(id),
+    event_id     INTEGER NOT NULL REFERENCES events(id),
+    lot_id       INTEGER NOT NULL REFERENCES lots(id),
+    seller_id    INTEGER NOT NULL REFERENCES users(id),
+    winner_id    INTEGER NOT NULL REFERENCES users(id),
+    picker_id    INTEGER NOT NULL REFERENCES users(id),
+    carrier_id   INTEGER REFERENCES users(id),
+    driver_id    INTEGER REFERENCES users(id),
+    auth_version INTEGER NOT NULL,
+    delivered_at TEXT    NOT NULL,
+    UNIQUE(lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_items_delivery
+    ON delivery_items(delivery_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_items_winner
+    ON delivery_items(event_id, winner_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_items_picker
+    ON delivery_items(event_id, picker_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_items_seller
+    ON delivery_items(event_id, seller_id);
 """
+
+# Roles accepted by newer builds.  The users table may already exist with the
+# original CHECK constraint, so init() rebuilds it when an old constraint is
+# detected (SQLite cannot ALTER a CHECK in place).
+USER_ROLES = ("buyer", "seller", "admin", "carrier", "driver")
 
 
 class Database:
@@ -103,6 +172,7 @@ class Database:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            self._migrate_users_role(conn)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
@@ -125,6 +195,52 @@ class Database:
             self._alias_secret = row["value"]
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_users_role(conn: sqlite3.Connection) -> None:
+        """Rebuild ``users`` if its CHECK predates the carrier/driver roles."""
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()
+        if sql is None or "carrier" in (sql[0] or ""):
+            return
+        # SQLite's table-rebuild procedure requires FK enforcement off for the
+        # rebuild connection; this short-lived init connection closes right away.
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE users_new (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id   INTEGER NOT NULL REFERENCES events(id),
+                    name       TEXT    NOT NULL,
+                    role       TEXT    NOT NULL CHECK (role IN
+                               ('buyer','seller','admin','carrier','driver')),
+                    token_hash TEXT    NOT NULL UNIQUE,
+                    budget     INTEGER CHECK (budget IS NULL OR budget >= 0),
+                    created_at TEXT    NOT NULL,
+                    UNIQUE (event_id, name)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO users_new(id, event_id, name, role, token_hash, "
+                "budget, created_at) SELECT id, event_id, name, role, "
+                "token_hash, budget, created_at FROM users"
+            )
+            conn.execute("DROP TABLE users")
+            conn.execute("ALTER TABLE users_new RENAME TO users")
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:  # pragma: no cover - defensive
+                raise sqlite3.IntegrityError(
+                    f"foreign key violations after migration: {violations[:5]}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     @property
     def alias_secret(self) -> str:

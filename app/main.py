@@ -41,6 +41,7 @@ from .models import (
     UpdateLot,
 )
 from .service import Service
+from .pickup_routes import register_pickup_routes
 
 DB_PATH = os.environ.get(
     "AUCTION_DB",
@@ -204,6 +205,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def my_bids(event_id: int, user=Depends(buyer_user),
                 svc: Service = Depends(get_service)):
         return svc.my_bids(event_id, user["id"])
+
+    # --- post-sale pickup / delivery ("交割 / 领货") ------------------------
+    register_pickup_routes(app, service, current_user)
 
     return app
 

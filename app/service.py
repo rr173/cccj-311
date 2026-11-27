@@ -26,6 +26,7 @@ from .domain import (
     evaluate_open_lots,
 )
 from .errors import ApiError
+from .pickups import PickupMixin
 
 TOKEN_PREFIX = "auk_"
 ADMIN_KEY = os.environ.get("AUCTION_ADMIN_KEY", "dev-admin-key")
@@ -133,7 +134,7 @@ def _audit(conn: sqlite3.Connection, event_id: int | None, actor_id: int | None,
     )
 
 
-class Service:
+class Service(PickupMixin):
     def __init__(self, db: Database):
         self.db = db
 

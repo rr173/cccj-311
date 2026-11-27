@@ -5,8 +5,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PublicRole = Literal["buyer", "seller"]
-Role = Literal["buyer", "seller", "admin"]
+PublicRole = Literal["buyer", "seller", "carrier", "driver"]
+Role = Literal["buyer", "seller", "admin", "carrier", "driver"]
 
 
 class StrictModel(BaseModel):
