@@ -9,10 +9,18 @@ Amounts are whole integers.
   max.  With a single bidder the price is the reserve (no second max exists);
   with no bids the lot has no price and cannot be won.
 * Budgets are event-wide: a buyer's commitment for the event is
-      used     = sum of purchase prices of closed lots they won
+      used     = sum of prices of the lots they currently hold an *effective*
+                 sale ("成交") for
       reserved = sum of their max on every open lot they currently lead
   A buyer who is not leading a lot reserves nothing there, but their bid is
   still kept because it determines that lot's price.
+
+The immutable auction result lives on :class:`Lot` (``winner_id`` /
+``purchase_price``).  When a revoked sale is resold, the *lot* keeps the
+original auction result while the effective sale moves to the new buyer.  The
+optional ``active_deals`` mapping (lot id -> :class:`Sale`) therefore drives
+"used"; without it the legacy lot fields are used, which keeps the pure rules
+backwards compatible.
 """
 from __future__ import annotations
 
@@ -35,6 +43,14 @@ class Lot:
     status: str                       # 'open' | 'closed'
     winner_id: int | None = None
     purchase_price: int | None = None
+
+
+@dataclass(frozen=True)
+class Sale:
+    """One effective sale of a lot (the thing that occupies budget)."""
+    lot_id: int
+    buyer_id: int
+    price: int
 
 
 @dataclass(frozen=True)
@@ -103,14 +119,26 @@ def compute_commitments(
     lots: Iterable[Lot],
     bids_by_lot: Mapping[int, Sequence[Bid]],
     outcomes: Mapping[int, Outcome] | None = None,
+    active_deals: Mapping[int, "Sale"] | None = None,
 ) -> dict[int, Commitment]:
-    """Per-buyer used + reserved across the whole event."""
+    """Per-buyer used + reserved across the whole event.
+
+    ``active_deals`` maps a lot id to its currently effective sale.  When it is
+    supplied it is authoritative: a lot whose sale was revoked simply has no
+    entry and therefore occupies nobody's budget, while a resold lot occupies
+    the *new* buyer's budget.  Without it, closed lots fall back to the
+    immutable auction result stored on the lots (legacy behaviour).
+    """
     used: dict[int, int] = defaultdict(int)
     reserved: dict[int, int] = defaultdict(int)
 
     for lot in lots:
         if lot.status == "closed":
-            if lot.winner_id is not None and lot.purchase_price is not None:
+            if active_deals is not None:
+                sale = active_deals.get(lot.id)
+                if sale is not None:
+                    used[sale.buyer_id] += sale.price
+            elif lot.winner_id is not None and lot.purchase_price is not None:
                 used[lot.winner_id] += lot.purchase_price
             continue
         outcome = (
@@ -133,6 +161,7 @@ def budget_violations(
     budgets: Mapping[int, int],
     preview_lot: int | None = None,
     preview_bids: Sequence[Bid] | None = None,
+    active_deals: Mapping[int, "Sale"] | None = None,
 ) -> list[tuple[int, int, Commitment]]:
     """Buyers whose budget would not cover their commitments.
 
@@ -140,7 +169,7 @@ def budget_violations(
     ordered by buyer id so error messages are deterministic.
     """
     outcomes = evaluate_open_lots(lots, bids_by_lot, preview_lot, preview_bids)
-    commitments = compute_commitments(lots, bids_by_lot, outcomes)
+    commitments = compute_commitments(lots, bids_by_lot, outcomes, active_deals)
     bad: list[tuple[int, int, Commitment]] = []
     for buyer_id in sorted(budgets):
         budget = budgets[buyer_id]

@@ -13,6 +13,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterator
 
 DB_PATH = os.environ.get(
@@ -82,6 +83,74 @@ CREATE TABLE IF NOT EXISTS bids (
 CREATE INDEX IF NOT EXISTS idx_bids_lot ON bids(lot_id, max_bid DESC, id ASC);
 CREATE INDEX IF NOT EXISTS idx_bids_buyer ON bids(event_id, buyer_id);
 
+-- ---------------------------------------------------------------------------
+-- Sales ("成交") after the auction
+--
+-- A lot's original auction result is kept immutable on ``lots`` (winner_id /
+-- purchase_price / status), so the public view keeps showing the original
+-- auction outcome.  Every actual sale is a row here with a stable, citable
+-- deal id.  An auction close creates the first ``kind='auction'`` deal; a
+-- directed re-sale after a revocation creates a ``kind='resale'`` deal.
+--
+-- ``uq_deals_active_lot`` guarantees at most one *effective* sale per lot at
+-- a time.  Revoking a deal keeps the row (history) and simply flips its status,
+-- which releases the buyer's budget and leaves all original records intact.
+CREATE TABLE IF NOT EXISTS deals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       INTEGER NOT NULL REFERENCES events(id),
+    lot_id         INTEGER NOT NULL REFERENCES lots(id),
+    deal_no        TEXT    NOT NULL DEFAULT '',
+    buyer_id       INTEGER NOT NULL REFERENCES users(id),
+    price          INTEGER NOT NULL CHECK (price >= 0),
+    kind           TEXT    NOT NULL DEFAULT 'auction'
+                   CHECK (kind IN ('auction', 'resale')),
+    status         TEXT    NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'revoked')),
+    offer_id       INTEGER REFERENCES offers(id),
+    created_at     TEXT    NOT NULL,
+    revoked_at     TEXT,
+    revoked_by     INTEGER REFERENCES users(id),
+    revoke_reason  TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deals_active_lot
+    ON deals(lot_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_deals_event
+    ON deals(event_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_deals_buyer
+    ON deals(event_id, buyer_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_deals_lot
+    ON deals(lot_id, id);
+
+-- Directed re-sale offers ("补售要约").  An offer never occupies budget; it
+-- only becomes a sale when its designated buyer accepts it.  At most one
+-- active offer may exist per lot (partial unique index below); issuing a new
+-- offer supersedes the previous active one ("换发").
+CREATE TABLE IF NOT EXISTS offers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER NOT NULL REFERENCES events(id),
+    lot_id      INTEGER NOT NULL REFERENCES lots(id),
+    buyer_id    INTEGER NOT NULL REFERENCES users(id),
+    price       INTEGER NOT NULL CHECK (price >= 1),
+    status      TEXT    NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'accepted', 'withdrawn',
+                                  'replaced')),
+    deal_id     INTEGER REFERENCES deals(id),
+    created_by  INTEGER REFERENCES users(id),
+    created_at  TEXT    NOT NULL,
+    decided_at  TEXT,
+    note        TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_offers_active_lot
+    ON offers(lot_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_offers_event
+    ON offers(event_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_offers_buyer
+    ON offers(event_id, buyer_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_offers_lot
+    ON offers(lot_id, id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id   INTEGER,
@@ -102,6 +171,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE TABLE IF NOT EXISTS pickup_auth (
     event_id     INTEGER NOT NULL REFERENCES events(id),
     lot_id       INTEGER PRIMARY KEY REFERENCES lots(id),
+    deal_id      INTEGER REFERENCES deals(id),
     winner_id    INTEGER NOT NULL REFERENCES users(id),
     carrier_id   INTEGER REFERENCES users(id),
     driver_id    INTEGER REFERENCES users(id),
@@ -128,13 +198,17 @@ CREATE TABLE IF NOT EXISTS deliveries (
     UNIQUE(event_id, seller_id, request_key)
 );
 
--- Every delivered lot appears exactly once: the UNIQUE(lot_id) is the hard
--- guard against a lot being delivered twice, even across racing processes.
+-- Every delivered lot appears exactly once per effective sale: the
+-- UNIQUE(lot_id) is the hard guard against a lot being delivered twice, even
+-- across racing processes.  ``deal_id`` records which sale was delivered; a
+-- delivery made against a revoked sale is rejected up front, and after a
+-- re-sale a new deal may be delivered afresh.
 CREATE TABLE IF NOT EXISTS delivery_items (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     delivery_id  INTEGER NOT NULL REFERENCES deliveries(id),
     event_id     INTEGER NOT NULL REFERENCES events(id),
     lot_id       INTEGER NOT NULL REFERENCES lots(id),
+    deal_id      INTEGER REFERENCES deals(id),
     seller_id    INTEGER NOT NULL REFERENCES users(id),
     winner_id    INTEGER NOT NULL REFERENCES users(id),
     picker_id    INTEGER NOT NULL REFERENCES users(id),
@@ -184,12 +258,17 @@ CREATE TABLE IF NOT EXISTS payments (
 -- ``active = 1`` marks the allocation of the currently effective payment;
 -- the partial unique index is the hard guarantee that a lot has at most one
 -- effective receipt at a time, even across racing processes.
+-- ``deal_id`` binds a receipt to the sale it pays for: a receipt registered
+-- against the original auction deal cannot be used to settle a re-sale (and
+-- vice versa), and revoking a sale is refused while its own receipt is still
+-- effective.
 CREATE TABLE IF NOT EXISTS payment_items (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     payment_id INTEGER NOT NULL REFERENCES payments(id),
     event_id   INTEGER NOT NULL REFERENCES events(id),
     serial_no  TEXT    NOT NULL DEFAULT '',
     lot_id     INTEGER NOT NULL REFERENCES lots(id),
+    deal_id    INTEGER REFERENCES deals(id),
     seller_id  INTEGER NOT NULL REFERENCES users(id),
     winner_id  INTEGER NOT NULL REFERENCES users(id),
     amount     INTEGER NOT NULL,
@@ -251,6 +330,17 @@ CREATE INDEX IF NOT EXISTS idx_payouts_event_status
     ON payouts(event_id, status, id);
 """
 
+# Schema helpers for columns added after the first release.  ``CREATE TABLE IF
+# NOT EXISTS`` does not add columns to an existing table, so an old database
+# gets them via an additive ``ALTER TABLE`` on startup.  Everything added is
+# nullable or defaulted, so existing rows stay valid and old normal sales keep
+# working without being re-entered.
+_COLUMN_MIGRATIONS = (
+    ("pickup_auth", "deal_id", "INTEGER REFERENCES deals(id)"),
+    ("delivery_items", "deal_id", "INTEGER REFERENCES deals(id)"),
+    ("payment_items", "deal_id", "INTEGER REFERENCES deals(id)"),
+)
+
 # Roles accepted by newer builds.  The users table may already exist with the
 # original CHECK constraint, so init() rebuilds it when an old constraint is
 # detected (SQLite cannot ALTER a CHECK in place).
@@ -286,6 +376,7 @@ class Database:
             self._migrate_users_role(conn)
             conn.execute("BEGIN IMMEDIATE")
             try:
+                self._migrate_deals(conn)
                 row = conn.execute(
                     "SELECT value FROM meta WHERE key='alias_secret'"
                 ).fetchone()
@@ -307,6 +398,54 @@ class Database:
         finally:
             conn.close()
         self._ready = True
+
+    @staticmethod
+    def _migrate_deals(conn: sqlite3.Connection) -> None:
+        """Add deal linkage columns and backfill one deal per legacy sale.
+
+        Every already-closed lot with a winner becomes a single
+        ``kind='auction'`` deal at its original price, so legacy sales are
+        immediately citable and revocable without re-entry.  Pickup
+        authorisations, deliveries and effective receipts of those lots are
+        pointed at the deal.  ``deal_no`` is the citable reference
+        ``DL-<id>``.  Runs inside ``BEGIN IMMEDIATE``.
+        """
+        for table, column, decl in _COLUMN_MIGRATIONS:
+            existing = {
+                r["name"] for r in conn.execute(
+                    f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        rows = conn.execute(
+            "SELECT id, event_id, winner_id, purchase_price, closed_at, "
+            "created_at FROM lots WHERE winner_id IS NOT NULL "
+            "AND purchase_price IS NOT NULL AND NOT EXISTS "
+            "(SELECT 1 FROM deals d WHERE d.lot_id = lots.id)"
+        ).fetchall()
+        for r in rows:
+            cur = conn.execute(
+                "INSERT INTO deals(event_id, lot_id, buyer_id, price, kind, "
+                "status, created_at) VALUES (?,?,?,?,'auction','active',?)",
+                (r["event_id"], r["id"], r["winner_id"],
+                 int(r["purchase_price"]), r["closed_at"] or now),
+            )
+            deal_id = cur.lastrowid
+            conn.execute(
+                "UPDATE deals SET deal_no=? WHERE id=?",
+                (f"DL-{deal_id:08d}", deal_id),
+            )
+            conn.execute(
+                "UPDATE pickup_auth SET deal_id=? WHERE lot_id=? "
+                "AND deal_id IS NULL", (deal_id, r["id"]))
+            conn.execute(
+                "UPDATE delivery_items SET deal_id=? WHERE lot_id=? "
+                "AND deal_id IS NULL", (deal_id, r["id"]))
+            conn.execute(
+                "UPDATE payment_items SET deal_id=? WHERE lot_id=? "
+                "AND deal_id IS NULL", (deal_id, r["id"]))
 
     @staticmethod
     def _migrate_users_role(conn: sqlite3.Connection) -> None:

@@ -79,6 +79,80 @@ python3 -m pytest -q
 
 常用错误码：`budget_required`、`budget_exceeded`、`budget_below_commitment`、`below_reserve`、`must_raise`、`lot_closed`、`event_closed`、`reserve_locked`、`forbidden`、`invalid_token`。
 
+## 成交撤销与定向补售（Revoke & Re-sale）
+
+收藏品成交后买家可能未付款即放弃。管理员可撤销这笔成交，并把同一件拍品按谈妥的整数价格定向补售给指定场内买家。**不重开竞价、不改拍品编号、不接外部平台；整场活动关闭后仍可办理。**
+
+### 成交（deal）
+
+- 每笔成交是一行 `deals`，带**可引用编号** `deal_no = DL-xxxxxxxx`（也接受数字 `deal_id`）。结标产生第一笔 `kind='auction'` 成交；定向补售接受后产生 `kind='resale'` 成交。
+- 拍品本身保留**原始竞拍结果**（`lots.winner_id / purchase_price`），公开端 `GET /events/{id}/lots` 永远只展示原竞拍结果，不披露补售对象或补售价。
+- 同一拍品同一时刻最多一笔 `active` 成交；被撤销的成交保留为历史（`status='revoked'`），不删流水、不改竞拍结果。
+- **预算占用跟随当前生效成交**：撤销释放原买家该笔成交占用的预算；补售接受则占用新买家预算。
+
+### 撤销条件
+
+- 仅**管理员**可撤销，且只能撤销一笔具体成交（`deal_id` 或 `deal_no`）。
+- 该成交必须**尚无有效收款、尚未交割**才可撤销。**曾有收款但已退票（bounced/refunded）不算有效收款**，可撤销；仍在 `active=1` 的收款分配则拒绝撤销。
+- 重复撤销同一成交幂等返回原结果（`replayed:true`），不会二次生效。
+- 撤销不会改写原竞拍结果，也不会删除出价、成交、收款、回执等历史流水。
+
+### 定向补售要约（offer）
+
+- 只有**已撤销、当前无生效成交**的拍品可发出补售要约：指定场内买家（可以是原买家）与**正整数价格**。
+- 要约**不占预算**。同一拍品最多一份 `active` 要约；管理员可撤回，或换发（新要约把旧 active 要约置为 `replaced`）。
+- 只有被指定的买家可以接受**仍有效**的要约；接受当时的本场预算在扣除**其他已用与领先预留**后必须够付该价格，否则 `409 budget_exceeded` 不生成成交。
+- 接受即按要约价格生成一笔新 `resale` 成交并占用新买家预算。**重复接受**同一已接受要约只返回原成交（`replayed:true`），不再次占用预算。
+- 新成交若同样未付款、未交割，同样可以再次撤销并补售（可链式进行）。
+
+### 新成交的收款 / 代领 / 交割
+
+- 新买家按原有规则：管理员登记收款、委托承运人/司机、卖家确认交割；交割与有效收款齐备后按**补售价**进入原卖家结算。
+- 收款、交割、领货授权、核验凭据、回执均**绑定具体成交**：同一拍品此前成交的流水、代领授权与核验凭据**不能**用于处理新成交（凭据 HMAC 还额外绑定成交 id，旧凭据必然失效）。
+- **原成交从未撤销的拍品**：登记收款、变更代领、确认交割可继续沿用只指向拍品的旧请求。
+- **撤销过的拍品**：上述操作必须明确是哪笔成交（`deal_id`/`deal_no`），只指向拍品的旧请求会以 `409 deal_reference_required` 拒绝，绝不解释成对当前买家生效。原请求重送仍可返回原结果（幂等），但不会重新生效。
+- 批量收款/交割仍按原规则整批确认（任一件不满足则整批不变）。
+
+### 并发
+
+撤销、接受、收款登记、交割都在同一把进程内 `RLock` + SQLite `BEGIN IMMEDIATE` 事务内串行。撤销与收款/交割/接受并发时，结果等价于某个实际生效顺序：要么撤销先落地（其后收款/交割因成交已撤销被拒），要么收款/交割先落地（随后撤销因该成交已收款/已交割被拒）——**不会既撤销又在该成交上新增有效收款或交割**。
+
+### 可见性
+
+- 管理员：全部成交与要约（含已撤销成交）。
+- 所属卖家：自己拍品的成交与要约。
+- 相关买家：发给自己或由自己取得的成交与要约（含自己那笔已撤销成交）；看不到别人的要约。
+- 公开端不新增任何字段，仍只展示原竞拍结果。
+
+### 接口（规范路径，另挂大量别名）
+
+| 方法 | 路径 | 身份 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/events/{id}/deals/revoke` | 管理员 | 撤销成交 `{"deal_id"\|"deal_no":..}`（幂等） |
+| POST | `/events/{id}/deals/{deal_ref}/revoke` | 管理员 | 同上（路径式） |
+| POST | `/events/{id}/offers` | 管理员 | 发出/换发补售要约 `{"lot_id","buyer_id","price"}` |
+| POST | `/events/{id}/lots/{lot}/offer` | 管理员 | 同上（按拍品） |
+| POST | `/events/{id}/offers/{offer}/withdraw` | 管理员 | 撤回有效要约 |
+| POST | `/events/{id}/offers/{offer}/accept` | 指定买家 | 接受要约（首次 `201`/重放 `200` `replayed:true`） |
+| GET | `/events/{id}/deals` | 相关人 | 成交列表（`?lot_id=&status=active\|revoked`） |
+| GET | `/events/{id}/deals/{deal_ref}` | 相关人 | 单笔成交 |
+| GET | `/events/{id}/offers` | 相关人 | 要约列表（`?lot_id=&status=`） |
+| GET | `/events/{id}/offers/{offer}` | 相关人 | 单份要约 |
+| GET | `/events/{id}/lots/{lot}/deals` | 相关人 | 该拍品成交历史 + 当前要约 |
+
+补售要约请求示例：
+
+```json
+{"lot_id": 11, "buyer_id": 2, "price": 500}
+```
+
+常用错误码新增：`deal_not_found`、`deal_lot_mismatch`、`deal_reference_required`、`deal_paid`、`already_delivered`、`deal_revoked`、`lot_not_revoked`、`lot_has_effective_deal`、`offer_not_active`、`offer_already_accepted`、`invalid_buyer`、`invalid_amount`。
+
+### 持久化与旧库
+
+- 新表 `deals / offers` 与拍卖数据同库；重启后成交、要约、编号全部保留。
+- 旧库启动时无损加列（`deal_id`）并**自动回填**：每个已成交且有赢家的拍品生成一笔 `DL-...` 成交，并把已有的领货授权、交割、有效收款指向该成交——旧库的正常成交**无需重新录入**。
+
 ## 成交后现场领货 / 交割（Pickup & Delivery）
 
 只适用于**已成交**（结标且有赢家）的标的；**整场活动关闭后仍可委托、派司机、交货与查回执**。交割流程不修改赢家、成交价或预算，也不接入任何支付或外部物流。
@@ -165,7 +239,7 @@ python3 -m pytest -q
 
 ### 记账规则
 
-- **收款登记**（管理员）：`流水号 + 付款买家 + 金额 + 一组互不重复拍品`，可跨多个卖家。所有拍品必须：本场被该买家赢得、当前没有有效收款；金额必须等于这些拍品 `purchase_price` 之和。任一条不满足则**整组不变**（单事务）。
+- **收款登记**（管理员）：`流水号 + 付款买家 + 金额 + 一组互不重复拍品`，可跨多个卖家。所有拍品必须：本场由该买家取得**当前生效成交**、当前没有有效收款；金额必须等于这些拍品当前生效成交价之和。任一条不满足则**整组不变**（单事务）。撤销过的拍品需以 `deal_id/deal_no`（或逐件 `deal_refs`）指明是哪笔成交。
 - **流水号幂等**：同一 `(活动, 流水号)` 重报相同内容（拍品顺序无关，按排序 id 规范化哈希）返回原记录（资源路由首次 `201`、重放 `200` 且 `replayed:true`）；内容不同返回 `409 idempotency_conflict`。
 - **退票**：管理员按流水号整笔退票。只停用**该流水自己的**收款分配，因此重复退票绝不会撤掉后来用**新流水**做的补缴；重复退票幂等返回原退票记录。
 - **可结算收入**：每件拍品在「存在 `active=1` 的收款分配」且「存在 `delivery_items` 交割记录」时，按成交价计入其卖家收入；两个条件谁先成立都行（收入为状态推导，天然不重复计）。
@@ -215,12 +289,14 @@ python3 -m pytest -q
 ```
 app/
   domain.py        纯规则：领先者、当前价、预算占用（无 DB / 无 HTTP）
-  db.py            SQLite schema、连接、串行化写事务、角色约束迁移
-  service.py       业务编排（校验、状态迁移、审计日志），继承 PickupMixin / SettlementMixin
-  pickups.py       领货/交割规则、凭据 HMAC、幂等哈希、回执与批量事务
+  db.py            SQLite schema、连接、串行化写事务、角色约束迁移、成交/要约表与旧库回填
+  service.py       业务编排（校验、状态迁移、审计日志），继承 PickupMixin / SettlementMixin / ResaleMixin
+  pickups.py       领货/交割规则、凭据 HMAC、幂等哈希、回执与批量事务（成交/成交号绑定）
   pickup_routes.py 领货/交割 HTTP 路由 + 多命名别名与宽松字段解析
-  settlements.py   线下收款/退票/可结算收入/打款额度与退票重平衡规则（SettlementMixin）
+  settlements.py   线下收款/退票/可结算收入/打款额度与退票重平衡规则（成交/成交号绑定）
   settlement_routes.py 结算 HTTP 路由 + 大量路径/字段别名与关键词兜底
+  resales.py       成交撤销、定向补售要约、接受即成新成交、预算与可见性规则（ResaleMixin）
+  resale_routes.py 撤销/补售/要约 HTTP 路由 + 别名 + 关键词兜底
   main.py          FastAPI 路由工厂 create_app()
   models.py        Pydantic 请求/响应模型（金额字段 strict int）
   errors.py        ApiError → {"error": {...}}
@@ -232,6 +308,8 @@ tests/
   test_http_concurrency.py    真实 uvicorn 并行请求
   test_pickup_delivery.py     领货/承运人/司机/交货/回执/重启/并发
   test_pickup_http_concurrency.py  交货 vs 改派的真实 HTTP 竞争
+  test_settlement_check.py    线下结算：收款/退票/交割/打款/重平衡/隐私/重启/并发
+  test_resale.py              撤销成交/定向补售：预算、要约、成交号、旧请求拒绝、并发、重启、旧库回填
 ```
 
 ## 已知取舍

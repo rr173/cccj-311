@@ -22,6 +22,31 @@ from .pickups import (
 )
 from .settlements import PAYER_KEYS, SERIAL_KEYS, SELLER_REF_KEYS
 
+DEAL_REF_KEYS = (
+    "deal_ref", "deal_id", "deal_no", "deal", "sale_id", "sale_no",
+    "transaction_id", "purchase_id",
+)
+
+
+def _deal_refs(data: dict, lot_ids: list[int]) -> list:
+    """Per-lot deal references from an item list, or a single top-level ref."""
+    for container_key in ("items", "payment_items", "allocations", "lines",
+                          "records"):
+        container = _np(data, container_key)
+        if isinstance(container, list) and container and all(
+                isinstance(x, dict) for x in container):
+            refs = []
+            for element in container:
+                refs.append(_np(element, *DEAL_REF_KEYS))
+            if any(r is not None for r in refs):
+                return refs
+    single = _np(data, *DEAL_REF_KEYS, "deal_refs", "deals")
+    if single is None:
+        return []
+    if isinstance(single, (list, tuple)):
+        return list(single)
+    return [single]
+
 
 def _norm_key(k: str) -> str:
     return re.sub(r"[_\-\s]", "", str(k).lower())
@@ -149,9 +174,10 @@ def register_settlement_routes(app, service, current_user) -> None:
         buyer_ref = _payer_ref(data)
         amount = _amount(data)
         ids = _lot_ids(data)
+        deal_refs = _deal_refs(data, ids)
         return service.register_payment(
             event_id, user["id"], serial_no=serial, buyer_ref=buyer_ref,
-            amount=amount, lot_ids=ids)
+            amount=amount, lot_ids=ids, deal_refs=deal_refs)
 
     def payment_resource(event_id: int, request: Request,
                          payload: Optional[dict] = Body(default=None),

@@ -20,6 +20,7 @@ from .domain import (
     Commitment,
     Lot,
     Outcome,
+    Sale,
     budget_violations,
     compute_commitments,
     evaluate_lot,
@@ -27,6 +28,7 @@ from .domain import (
 )
 from .errors import ApiError
 from .pickups import PickupMixin
+from .resales import ResaleMixin
 from .settlements import SettlementMixin
 
 TOKEN_PREFIX = "auk_"
@@ -115,6 +117,37 @@ def _budgets(conn: sqlite3.Connection, event_id: int) -> dict[int, int]:
     return {r["id"]: r["budget"] for r in rows}
 
 
+def _active_deals(conn: sqlite3.Connection, event_id: int) -> dict[int, Sale]:
+    """Currently effective sale per lot (revoked deals excluded)."""
+    rows = conn.execute(
+        "SELECT lot_id, buyer_id, price FROM deals "
+        "WHERE event_id=? AND status='active'",
+        (event_id,),
+    ).fetchall()
+    return {r["lot_id"]: Sale(r["lot_id"], r["buyer_id"], int(r["price"]))
+            for r in rows}
+
+
+def _active_deal(conn: sqlite3.Connection, event_id: int,
+                 lot_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM deals WHERE event_id=? AND lot_id=? AND status='active'",
+        (event_id, lot_id),
+    ).fetchone()
+
+
+def create_deal(conn: sqlite3.Connection, event_id: int, lot_id: int,
+                buyer_id: int, price: int, *, kind: str,
+                offer_id: int | None = None) -> sqlite3.Row:
+    """Insert one effective sale and assign its citable ``DL-...`` number."""
+    # Single implementation lives in ``resales`` (imported lazily to avoid a
+    # module cycle); the auction side and the resale side share it.
+    from .resales import create_deal as _create_deal
+
+    return _create_deal(conn, event_id, lot_id, buyer_id, price,
+                        kind=kind, offer_id=offer_id)
+
+
 def _lot_bids(conn: sqlite3.Connection, lot_id: int) -> list[Bid]:
     rows = conn.execute(
         "SELECT id, buyer_id, max_bid FROM bids WHERE lot_id=? ORDER BY id", (lot_id,)
@@ -135,7 +168,7 @@ def _audit(conn: sqlite3.Connection, event_id: int | None, actor_id: int | None,
     )
 
 
-class Service(PickupMixin, SettlementMixin):
+class Service(PickupMixin, SettlementMixin, ResaleMixin):
     def __init__(self, db: Database):
         self.db = db
 
@@ -243,7 +276,8 @@ class Service(PickupMixin, SettlementMixin):
             bids = _bids_by_lot(conn, event_id)
             budgets = _budgets(conn, event_id)
             budgets[buyer_id] = budget
-            bad = budget_violations(lots, bids, budgets)
+            bad = budget_violations(lots, bids, budgets,
+                                    active_deals=_active_deals(conn, event_id))
             if bad:
                 _, _, commitment = bad[0]
                 raise ApiError(
@@ -252,7 +286,7 @@ class Service(PickupMixin, SettlementMixin):
                 )
             conn.execute("UPDATE users SET budget=? WHERE id=?", (budget, buyer_id))
             _audit(conn, event_id, buyer_id, "budget_set", str(budget))
-            return self._commitment(lots, bids, buyer_id)
+            return self._commitment(conn, event_id, lots, bids, buyer_id)
 
     def budget_view(self, event_id: int, buyer_id: int) -> dict:
         with self.db.read() as conn:
@@ -261,7 +295,7 @@ class Service(PickupMixin, SettlementMixin):
                 raise ApiError(403, "forbidden", "Only buyers have a budget")
             lots = _lots(conn, event_id)
             bids = _bids_by_lot(conn, event_id)
-            commitment = self._commitment(lots, bids, buyer_id)
+            commitment = self._commitment(conn, event_id, lots, bids, buyer_id)
             budget = buyer["budget"]
             return {
                 "budget": budget,
@@ -272,10 +306,14 @@ class Service(PickupMixin, SettlementMixin):
             }
 
     @staticmethod
-    def _commitment(lots: Sequence[Lot], bids: dict[int, list[Bid]],
+    def _commitment(conn: sqlite3.Connection, event_id: int,
+                    lots: Sequence[Lot], bids: dict[int, list[Bid]],
                     buyer_id: int) -> Commitment:
         outcomes = evaluate_open_lots(lots, bids)
-        return compute_commitments(lots, bids, outcomes).get(buyer_id) or Commitment()
+        return compute_commitments(
+            lots, bids, outcomes,
+            _active_deals(conn, event_id),
+        ).get(buyer_id) or Commitment()
 
     # ------------------------------------------------------------------ lots
     def create_lot(self, event_id: int, seller_id: int, title: str,
@@ -407,7 +445,8 @@ class Service(PickupMixin, SettlementMixin):
             preview.append(Bid(mine.id if mine else _next_bid_id(conn), buyer_id, max_bid))
             budgets = _budgets(conn, event_id)
             bad = budget_violations(lots, bids, budgets,
-                                    preview_lot=lot_id, preview_bids=preview)
+                                    preview_lot=lot_id, preview_bids=preview,
+                                    active_deals=_active_deals(conn, event_id))
             if bad:
                 offender_id, offender_budget, commitment = bad[0]
                 if offender_id == buyer_id:
@@ -478,12 +517,18 @@ class Service(PickupMixin, SettlementMixin):
 
         # Bids are kept (not deleted): they are history and the loser's max is
         # what set the price.  Budget maths ignores them because the lot is
-        # closed, and the winner's used amount becomes the purchase price.
+        # closed, and the winner's used amount becomes the deal price.
         conn.execute(
             "UPDATE lots SET status='closed', winner_id=?, purchase_price=?, "
             "closed_at=?, version=version+1 WHERE id=?",
             (winner_id, price, _now(), lot_id),
         )
+        deal = None
+        if win:
+            # The immutable auction result stays on the lot (public view); the
+            # effective, citable sale lives in ``deals``.
+            deal = create_deal(conn, event_id, lot_id, winner_id, price,
+                               kind="auction")
         _audit(conn, event_id, None, "lot_closed",
                f"lot={lot_id} winner={winner_id} price={price}")
 
@@ -491,7 +536,8 @@ class Service(PickupMixin, SettlementMixin):
         # guard should never fire; it protects against future rule bugs.
         lots = _lots(conn, event_id)
         bids = _bids_by_lot(conn, event_id)
-        if budget_violations(lots, bids, _budgets(conn, event_id)):  # pragma: no cover
+        if budget_violations(lots, bids, _budgets(conn, event_id),
+                             active_deals=_active_deals(conn, event_id)):  # pragma: no cover
             raise ApiError(500, "invariant_violation",
                            "Closing this lot would overrun a buyer's budget")
 
@@ -503,6 +549,8 @@ class Service(PickupMixin, SettlementMixin):
                 if winner_id is not None else None
             ),
             "purchase_price": price,
+            "deal_id": deal["id"] if deal is not None else None,
+            "deal_no": deal["deal_no"] if deal is not None else None,
         }
 
     # ------------------------------------------------------- buyer private v.
@@ -534,7 +582,17 @@ class Service(PickupMixin, SettlementMixin):
                         "updated_at": r["updated_at"],
                     })
                 else:
-                    won = r["winner_id"] == buyer_id
+                    # Closed: report this buyer's own latest deal on the lot.
+                    mine_deal = conn.execute(
+                        "SELECT * FROM deals WHERE lot_id=? AND buyer_id=? "
+                        "ORDER BY id DESC LIMIT 1", (r["lot_id"], buyer_id),
+                    ).fetchone()
+                    latest = conn.execute(
+                        "SELECT * FROM deals WHERE lot_id=? ORDER BY id DESC "
+                        "LIMIT 1", (r["lot_id"],),
+                    ).fetchone()
+                    won = mine_deal is not None \
+                        and mine_deal["status"] == "active"
                     out.append({
                         "lot_id": r["lot_id"],
                         "lot_title": r["title"],
@@ -542,7 +600,15 @@ class Service(PickupMixin, SettlementMixin):
                         "lot_status": "closed",
                         "leading": False,
                         "won": won,
-                        "purchase_price": r["purchase_price"] if won else None,
+                        "purchase_price": (
+                            mine_deal["price"] if won else None),
+                        "deal_id": mine_deal["id"] if mine_deal else None,
+                        "deal_no": mine_deal["deal_no"] if mine_deal else None,
+                        "deal_status": (
+                            mine_deal["status"] if mine_deal else None),
+                        "current_deal_id": latest["id"] if latest else None,
+                        "current_deal_status": (
+                            latest["status"] if latest else None),
                         "submitted_at": r["created_at"],
                         "updated_at": r["updated_at"],
                     })

@@ -265,8 +265,12 @@ def extract_request_key(data: dict, headers: Any = None) -> str | None:
 # Pure helpers
 # ---------------------------------------------------------------------------
 def compute_credential(secret: str, event_id: int, lot_id: int,
-                       version: int, picker_id: int) -> str:
-    msg = (f"pickup-credential:v1:{event_id}:{lot_id}:"
+                       version: int, picker_id: int,
+                       deal_id: int | None = None) -> str:
+    # ``deal_id`` binds a credential to one specific sale, so a credential
+    # issued for a revoked sale can never verify against a re-sale -- even
+    # when the same lot, picker and auth version recur.
+    msg = (f"pickup-credential:v1:{event_id}:{lot_id}:{deal_id}:"
            f"{version}:{picker_id}").encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).digest()
     return CREDENTIAL_PREFIX + base64.urlsafe_b64encode(digest).decode().rstrip("=")
@@ -281,7 +285,9 @@ def same_credential(a: str | None, b: str) -> bool:
 def canonical_delivery_hash(picker_id: int,
                             items: Sequence[dict]) -> str:
     canonical = sorted(
-        (int(i["lot_id"]), str(i.get("credential") or "")) for i in items
+        (int(i["lot_id"]), str(i.get("credential") or ""),
+         None if i.get("deal_ref") in (None, "") else str(i.get("deal_ref")))
+        for i in items
     )
     payload = json.dumps(
         {"picker_id": picker_id, "items": canonical},
@@ -347,17 +353,85 @@ class PickupMixin:
     """Adds post-sale pickup / delivery operations to :class:`Service`."""
 
     # ------------------------------------------------------------ internals
-    def _auth_state(self, conn: sqlite3.Connection, lot: sqlite3.Row) -> dict:
+    def _effective_deal(self, conn: sqlite3.Connection,
+                        lot: sqlite3.Row) -> sqlite3.Row | None:
+        """The sale currently governing this lot's pickup state."""
+        row = conn.execute(
+            "SELECT * FROM deals WHERE lot_id=? AND status='active'",
+            (lot["id"],),
+        ).fetchone()
+        return row
+
+    def _deal_has_revocation(self, conn: sqlite3.Connection,
+                             lot_id: int) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM deals WHERE lot_id=? AND status='revoked' LIMIT 1",
+            (lot_id,),
+        ).fetchone() is not None
+
+    def _scoped_deal(self, conn: sqlite3.Connection, event_id: int,
+                     lot: sqlite3.Row, deal_ref: Any) -> sqlite3.Row | None:
+        """Which sale a per-lot operation applies to.
+
+        Explicit references must name a deal of this event on this lot.  With
+        no reference the effective deal is used, but only while the lot has no
+        revocation history: after a revoke the caller must say which deal, so a
+        legacy lot-only request is never silently applied to the new buyer.
+        """
+        if deal_ref is not None:
+            row = None
+            rid = as_int(deal_ref)
+            if rid is not None:
+                row = conn.execute(
+                    "SELECT * FROM deals WHERE event_id=? AND id=?",
+                    (event_id, rid)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT * FROM deals WHERE event_id=? AND deal_no=?",
+                    (event_id, str(deal_ref).strip())).fetchone()
+            if row is None:
+                raise ApiError(404, "deal_not_found",
+                               "Deal not found in this event")
+            if row["lot_id"] != lot["id"]:
+                raise ApiError(409, "deal_lot_mismatch",
+                               "The referenced deal belongs to a different lot")
+            return row
+        deal = self._effective_deal(conn, lot)
+        if deal is None:
+            return None
+        if self._deal_has_revocation(conn, lot["id"]):
+            raise ApiError(
+                409, "deal_reference_required",
+                "This lot has a revoked sale; specify the deal "
+                "(deal_id/deal_no) the operation applies to",
+            )
+        return deal
+
+    def _auth_state(self, conn: sqlite3.Connection, lot: sqlite3.Row,
+                    deal: sqlite3.Row | None = None) -> dict:
+        if deal is None:
+            deal = self._effective_deal(conn, lot)
         row = conn.execute(
             "SELECT * FROM pickup_auth WHERE lot_id=?", (lot["id"],)
         ).fetchone()
+        # An authorisation row belongs to the sale it was created for.  A row
+        # left over from a revoked/other deal is ignored, so stale delegations
+        # never carry over to a re-sale.
+        if row is not None and deal is not None \
+                and row["deal_id"] not in (None, deal["id"]):
+            row = None
+        winner_id = deal["buyer_id"] if deal is not None else lot["winner_id"]
         if row is None:
             return {
-                "row": None, "winner_id": lot["winner_id"],
+                "row": None, "deal": deal, "deal_id": (
+                    deal["id"] if deal is not None else None),
+                "winner_id": winner_id,
                 "carrier_id": None, "driver_id": None, "version": 1,
             }
         return {
-            "row": row, "winner_id": row["winner_id"],
+            "row": row, "deal": deal,
+            "deal_id": (deal["id"] if deal is not None else row["deal_id"]),
+            "winner_id": row["winner_id"],
             "carrier_id": row["carrier_id"], "driver_id": row["driver_id"],
             "version": row["auth_version"],
         }
@@ -371,13 +445,19 @@ class PickupMixin:
         return state["winner_id"], "winner"
 
     def _delivered_row(self, conn: sqlite3.Connection,
-                       lot_id: int) -> sqlite3.Row | None:
-        return conn.execute(
-            "SELECT di.*, d.request_key, d.receipt_no, d.created_at AS receipt_created "
+                       lot_id: int,
+                       deal_id: int | None = None) -> sqlite3.Row | None:
+        sql = (
+            "SELECT di.*, d.request_key, d.receipt_no, "
+            "d.created_at AS receipt_created "
             "FROM delivery_items di JOIN deliveries d ON d.id=di.delivery_id "
-            "WHERE di.lot_id=?",
-            (lot_id,),
-        ).fetchone()
+            "WHERE di.lot_id=?"
+        )
+        params: list[Any] = [lot_id]
+        if deal_id is not None:
+            sql += " AND di.deal_id=?"
+            params.append(deal_id)
+        return conn.execute(sql, params).fetchone()
 
     @staticmethod
     def _brief(row: sqlite3.Row | None) -> dict | None:
@@ -416,7 +496,10 @@ class PickupMixin:
     def _validate_trustee_target(self, conn, event_id, target_ref, lots, actor_id):
         target = resolve_account(conn, event_id, target_ref)
         for lot in lots:
-            forbidden = {lot["seller_id"], lot["winner_id"], actor_id}
+            winner_id = self._effective_deal(conn, lot)
+            winner = winner_id["buyer_id"] if winner_id is not None \
+                else lot["winner_id"]
+            forbidden = {lot["seller_id"], winner, actor_id}
             if target["id"] in forbidden:
                 raise ApiError(
                     422, "invalid_trustee",
@@ -432,35 +515,40 @@ class PickupMixin:
         next_version = state["version"] + 1
         new_carrier = state["carrier_id"] if carrier_id is ... else carrier_id
         new_driver = state["driver_id"] if driver_id is ... else driver_id
+        deal_id = state["deal_id"]
         if state["row"] is None:
             conn.execute(
-                "INSERT INTO pickup_auth(event_id, lot_id, winner_id, "
+                "INSERT INTO pickup_auth(event_id, lot_id, deal_id, winner_id, "
                 "carrier_id, driver_id, auth_version, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (lot["event_id"], lot["id"], lot["winner_id"],
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (lot["event_id"], lot["id"], deal_id, state["winner_id"],
                  new_carrier, new_driver, next_version, now, now),
             )
         else:
             conn.execute(
-                "UPDATE pickup_auth SET carrier_id=?, driver_id=?, "
+                "UPDATE pickup_auth SET deal_id=?, carrier_id=?, driver_id=?, "
                 "auth_version=?, updated_at=? WHERE lot_id=?",
-                (new_carrier, new_driver, next_version, now, lot["id"]),
+                (deal_id, new_carrier, new_driver, next_version, now, lot["id"]),
             )
 
     def _state_payload(self, conn: sqlite3.Connection,
-                       lot: sqlite3.Row) -> dict:
-        state = self._auth_state(conn, lot)
+                       lot: sqlite3.Row,
+                       deal: sqlite3.Row | None = None) -> dict:
+        if deal is None:
+            deal = self._effective_deal(conn, lot)
+        state = self._auth_state(conn, lot, deal)
         picker_id, kind = self._picker_of(state)
-        delivered = self._delivered_row(conn, lot["id"])
+        delivered = self._delivered_row(
+            conn, lot["id"], state["deal_id"])
         is_delivered = delivered is not None
         secret = self.db.alias_secret
         credential = None
-        if not is_delivered and lot["winner_id"] is not None:
+        if not is_delivered and state["winner_id"] is not None:
             credential = compute_credential(
                 secret, lot["event_id"], lot["id"],
-                state["version"], picker_id,
+                state["version"], picker_id, state["deal_id"],
             )
-        winner = self._user_brief(conn, lot["event_id"], lot["winner_id"])
+        winner = self._user_brief(conn, lot["event_id"], state["winner_id"])
         seller = self._user_brief(conn, lot["event_id"], lot["seller_id"])
         carrier = self._user_brief(conn, lot["event_id"], state["carrier_id"])
         driver = self._user_brief(conn, lot["event_id"], state["driver_id"])
@@ -486,13 +574,15 @@ class PickupMixin:
             "id": lot["id"],
             "title": lot["title"],
             "lot_status": lot["status"],
+            "deal_id": state["deal_id"],
             "status": "delivered" if is_delivered else "pending_pickup",
             "delivery_status": "delivered" if is_delivered else "pending",
             "pickup_status": "delivered" if is_delivered else "pending",
             "delivered": is_delivered,
             "winner": winner,
-            "winner_id": lot["winner_id"],
+            "winner_id": state["winner_id"],
             "winner_name": winner["name"] if winner else None,
+            "buyer_id": state["winner_id"],
             "seller": seller,
             "seller_id": lot["seller_id"],
             "seller_name": seller["name"] if seller else None,
@@ -534,6 +624,7 @@ class PickupMixin:
         payload["grant"] = authorization
         return payload
 
+
     # ------------------------------------------------- buyer: carrier grants
     def delegate_carrier(self, event_id: int, actor_id: int,
                          lot_ids: Sequence[Any], carrier_ref: Any) -> dict:
@@ -547,23 +638,24 @@ class PickupMixin:
 
             states: list[dict] = []
             for lot in lots:
-                if lot["winner_id"] is None:
+                deal = self._effective_deal(conn, lot)
+                if deal is None:
                     raise ApiError(409, "lot_not_sold",
                                    "Only sold lots can be entrusted for pickup")
-                if lot["winner_id"] != actor_id:
+                if deal["buyer_id"] != actor_id:
                     raise ApiError(403, "forbidden",
                                    "Only the winning buyer can entrust this lot")
-                if self._delivered_row(conn, lot["id"]) is not None:
+                if self._delivered_row(conn, lot["id"], deal["id"]) is not None:
                     raise ApiError(409, "already_delivered",
                                    "Delivered lots can no longer be changed")
-                state = self._auth_state(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 # Re-delegation always bumps the version and clears any driver,
                 # even when the carrier is unchanged.
                 self._upsert_auth(
                     conn, lot, state,
                     carrier_id=target["id"], driver_id=None,
                 )
-                states.append(self._auth_state(conn, lot))
+                states.append(self._auth_state(conn, lot, deal))
             _audit(conn, event_id, actor_id, "pickup_delegate",
                    f"lots={ids} carrier={target['id']}")
             items = [self._state_payload(conn, lot) for lot in lots]
@@ -588,15 +680,16 @@ class PickupMixin:
             _user(conn, event_id, actor_id)
             lots = self._load_batch_lots(conn, event_id, ids)
             for lot in lots:
-                if lot["winner_id"] is None:
+                deal = self._effective_deal(conn, lot)
+                if deal is None:
                     raise ApiError(409, "lot_not_sold", "Lot is not sold")
-                if lot["winner_id"] != actor_id:
+                if deal["buyer_id"] != actor_id:
                     raise ApiError(403, "forbidden",
                                    "Only the winning buyer can recover this lot")
-                if self._delivered_row(conn, lot["id"]) is not None:
+                if self._delivered_row(conn, lot["id"], deal["id"]) is not None:
                     raise ApiError(409, "already_delivered",
                                    "Delivered lots can no longer be recovered")
-                state = self._auth_state(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 if state["carrier_id"] is None:
                     raise ApiError(
                         409, "no_active_delegation",
@@ -604,7 +697,8 @@ class PickupMixin:
                         "delegation to recover",
                     )
             for lot in lots:
-                state = self._auth_state(conn, lot)
+                deal = self._effective_deal(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 self._upsert_auth(conn, lot, state,
                                   carrier_id=None, driver_id=None)
             _audit(conn, event_id, actor_id, "pickup_revoke_carrier",
@@ -633,18 +727,19 @@ class PickupMixin:
             lots = self._load_batch_lots(conn, event_id, ids)
             target = resolve_account(conn, event_id, driver_ref)
             for lot in lots:
-                if lot["winner_id"] is None:
+                deal = self._effective_deal(conn, lot)
+                if deal is None:
                     raise ApiError(409, "lot_not_sold", "Lot is not sold")
-                if self._delivered_row(conn, lot["id"]) is not None:
+                if self._delivered_row(conn, lot["id"], deal["id"]) is not None:
                     raise ApiError(409, "already_delivered",
                                    "Delivered lots can no longer be changed")
-                state = self._auth_state(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 if state["carrier_id"] != actor_id:
                     raise ApiError(
                         403, "forbidden",
                         "Only the current carrier can assign its driver",
                     )
-                forbidden = {lot["seller_id"], lot["winner_id"], actor_id}
+                forbidden = {lot["seller_id"], deal["buyer_id"], actor_id}
                 if target["id"] in forbidden:
                     raise ApiError(
                         422, "invalid_driver",
@@ -652,7 +747,8 @@ class PickupMixin:
                         "the acting carrier",
                     )
             for lot in lots:
-                state = self._auth_state(conn, lot)
+                deal = self._effective_deal(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 # Assign/replace always bumps the version, even for same driver.
                 self._upsert_auth(conn, lot, state, driver_id=target["id"])
             _audit(conn, event_id, actor_id, "pickup_assign_driver",
@@ -679,12 +775,13 @@ class PickupMixin:
             _user(conn, event_id, actor_id)
             lots = self._load_batch_lots(conn, event_id, ids)
             for lot in lots:
-                if lot["winner_id"] is None:
+                deal = self._effective_deal(conn, lot)
+                if deal is None:
                     raise ApiError(409, "lot_not_sold", "Lot is not sold")
-                if self._delivered_row(conn, lot["id"]) is not None:
+                if self._delivered_row(conn, lot["id"], deal["id"]) is not None:
                     raise ApiError(409, "already_delivered",
                                    "Delivered lots can no longer be changed")
-                state = self._auth_state(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 if state["carrier_id"] != actor_id:
                     raise ApiError(
                         403, "forbidden",
@@ -697,7 +794,8 @@ class PickupMixin:
                         "assignment to withdraw",
                     )
             for lot in lots:
-                state = self._auth_state(conn, lot)
+                deal = self._effective_deal(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 self._upsert_auth(conn, lot, state, driver_id=None)
             _audit(conn, event_id, actor_id, "pickup_revoke_driver",
                    f"lots={ids}")
@@ -716,10 +814,13 @@ class PickupMixin:
             }
 
     # ------------------------------------------------------------- queries
-    def _require_pickup_viewer(self, conn, lot, actor):
-        state = self._auth_state(conn, lot)
+    def _require_pickup_viewer(self, conn, lot, actor, deal=None):
+        if deal is None:
+            deal = self._effective_deal(conn, lot)
+        state = self._auth_state(conn, lot, deal)
+        winner_id = state["winner_id"]
         allowed = {
-            lot["seller_id"], lot["winner_id"],
+            lot["seller_id"], winner_id,
             state["carrier_id"], state["driver_id"],
         }
         if actor["role"] == "admin":
@@ -730,15 +831,17 @@ class PickupMixin:
                            "trustee can view pickup status")
         return state
 
-    def pickup_status(self, event_id: int, actor_id: int, lot_id: int) -> dict:
+    def pickup_status(self, event_id: int, actor_id: int, lot_id: int,
+                      deal_ref: Any = None) -> dict:
         with self.db.read() as conn:
             _event(conn, event_id)
             actor = _user(conn, event_id, actor_id)
             lot = self._load_batch_lots(conn, event_id, [lot_id])[0]
-            if lot["winner_id"] is None:
+            deal = self._scoped_deal(conn, event_id, lot, deal_ref)
+            if deal is None:
                 raise ApiError(409, "lot_not_sold", "Lot is not sold")
-            self._require_pickup_viewer(conn, lot, actor)
-            payload = self._state_payload(conn, lot)
+            self._require_pickup_viewer(conn, lot, actor, deal)
+            payload = self._state_payload(conn, lot, deal)
             picker_id = payload["authorized_picker_id"]
             payload["viewer_id"] = actor_id
             payload["viewer_is_picker"] = actor_id == picker_id
@@ -748,21 +851,24 @@ class PickupMixin:
             return payload
 
     def pickup_credential(self, event_id: int, actor_id: int,
-                         lot_id: int) -> dict:
+                         lot_id: int, deal_ref: Any = None) -> dict:
         with self.db.read() as conn:
             _event(conn, event_id)
             actor = _user(conn, event_id, actor_id)
             lot = self._load_batch_lots(conn, event_id, [lot_id])[0]
-            if lot["winner_id"] is None:
+            deal = self._scoped_deal(conn, event_id, lot, deal_ref)
+            if deal is None:
                 raise ApiError(409, "lot_not_sold", "Lot is not sold")
-            self._require_pickup_viewer(conn, lot, actor)
-            if self._delivered_row(conn, lot_id) is not None:
+            self._require_pickup_viewer(conn, lot, actor, deal)
+            if self._delivered_row(conn, lot_id, deal["id"]) is not None:
                 raise ApiError(409, "already_delivered",
                                "Delivered lots no longer issue credentials")
-            payload = self._state_payload(conn, lot)
+            payload = self._state_payload(conn, lot, deal)
             return {
                 "event_id": event_id,
                 "lot_id": lot_id,
+                "deal_id": deal["id"],
+                "deal_no": deal["deal_no"],
                 "id": lot_id,
                 "credential": payload["credential"],
                 "pickup_credential": payload["credential"],
@@ -783,44 +889,46 @@ class PickupMixin:
         with self.db.read() as conn:
             _event(conn, event_id)
             actor = _user(conn, event_id, actor_id)
-            clauses: list[str] = []
-            params: list[Any] = [event_id]
-            if actor["role"] != "admin" or as_role:
-                role = as_role
-                if role in ("winner", "buyer"):
-                    clauses.append("l.winner_id=?")
-                    params.append(actor_id)
-                elif role in ("carrier", "trustee"):
-                    clauses.append("pa.carrier_id=?")
-                    params.append(actor_id)
-                elif role == "driver":
-                    clauses.append("pa.driver_id=?")
-                    params.append(actor_id)
-                elif role == "seller":
-                    clauses.append("l.seller_id=?")
-                    params.append(actor_id)
-                elif actor["role"] == "seller":
-                    clauses.append("l.seller_id=?")
-                    params.append(actor_id)
-                elif actor["role"] == "buyer":
-                    clauses.append("l.winner_id=?")
-                    params.append(actor_id)
-                else:
-                    clauses.append("(l.winner_id=? OR pa.carrier_id=? "
-                                   "OR pa.driver_id=? OR l.seller_id=?)")
-                    params.extend([actor_id, actor_id, actor_id, actor_id])
-            where = " AND ".join(clauses)
-            sql = (
-                "SELECT l.* FROM lots l LEFT JOIN pickup_auth pa "
-                "ON pa.lot_id=l.id WHERE l.event_id=? AND l.winner_id IS NOT NULL"
-            )
-            if where:
-                sql += " AND " + where
-            sql += " ORDER BY l.id"
-            lots = conn.execute(sql, params).fetchall()
+            # Only lots whose sale is currently effective take part.
+            rows = conn.execute(
+                "SELECT l.*, d.id AS deal_id, d.buyer_id AS deal_buyer_id, "
+                "d.price AS deal_price, d.deal_no AS deal_no "
+                "FROM lots l JOIN deals d ON d.lot_id=l.id AND d.status='active' "
+                "WHERE l.event_id=? ORDER BY l.id",
+                (event_id,),
+            ).fetchall()
             items = []
-            for lot in lots:
-                payload = self._state_payload(conn, lot)
+            for lot in rows:
+                deal = conn.execute("SELECT * FROM deals WHERE id=?",
+                                    (lot["deal_id"],)).fetchone()
+                buyer_id = lot["deal_buyer_id"]
+                state = self._auth_state(conn, lot, deal)
+                if actor["role"] != "admin" or as_role:
+                    role = as_role
+                    if role in ("winner", "buyer"):
+                        if buyer_id != actor_id:
+                            continue
+                    elif role in ("carrier", "trustee"):
+                        if state["carrier_id"] != actor_id:
+                            continue
+                    elif role == "driver":
+                        if state["driver_id"] != actor_id:
+                            continue
+                    elif role == "seller":
+                        if lot["seller_id"] != actor_id:
+                            continue
+                    elif actor["role"] == "seller":
+                        if lot["seller_id"] != actor_id:
+                            continue
+                    elif actor["role"] == "buyer":
+                        if buyer_id != actor_id:
+                            continue
+                    else:
+                        if actor_id not in (buyer_id, state["carrier_id"],
+                                            state["driver_id"],
+                                            lot["seller_id"]):
+                            continue
+                payload = self._state_payload(conn, lot, deal)
                 if status_filter in ("pending", "undelivered") and payload["delivered"]:
                     continue
                 if status_filter == "delivered" and not payload["delivered"]:
@@ -861,6 +969,7 @@ class PickupMixin:
             normalized.append({
                 "lot_id": lot_id,
                 "credential": item.get("credential"),
+                "deal_ref": item.get("deal_ref"),
             })
 
         with self.db.tx() as conn:
@@ -898,23 +1007,29 @@ class PickupMixin:
             # Phase 1 -- validate the ENTIRE group before writing anything.
             for item in normalized:
                 lot = by_id[item["lot_id"]]
-                if lot["winner_id"] is None:
-                    raise ApiError(409, "lot_not_sold",
-                                   "Only sold lots can be delivered")
                 if lot["seller_id"] != actor_id:
                     raise ApiError(
                         403, "forbidden",
                         "Every lot in a delivery must belong to the confirming "
                         "seller",
                     )
-                if self._delivered_row(conn, lot["id"]) is not None:
+                deal = self._scoped_deal(
+                    conn, event_id, lot, item["deal_ref"])
+                if deal is None:
+                    raise ApiError(409, "lot_not_sold",
+                                   "Only sold lots can be delivered")
+                if deal["status"] != "active":
+                    raise ApiError(409, "deal_revoked",
+                                   "This lot's sale has been revoked")
+                item["deal_id"] = deal["id"]
+                if self._delivered_row(conn, lot["id"], deal["id"]) is not None:
                     raise ApiError(409, "already_delivered",
                                    "A lot in this group is already delivered")
-                state = self._auth_state(conn, lot)
+                state = self._auth_state(conn, lot, deal)
                 effective_id, _kind = self._picker_of(state)
                 expected = compute_credential(
                     secret, event_id, lot["id"],
-                    state["version"], effective_id,
+                    state["version"], effective_id, deal["id"],
                 )
                 if not same_credential(item.get("credential"), expected):
                     raise ApiError(
@@ -947,15 +1062,18 @@ class PickupMixin:
                 )
                 for item in normalized:
                     lot = by_id[item["lot_id"]]
-                    state = self._auth_state(conn, lot)
+                    deal = conn.execute(
+                        "SELECT * FROM deals WHERE id=?", (item["deal_id"],
+                                                           )).fetchone()
+                    state = self._auth_state(conn, lot, deal)
                     effective_id, _kind = self._picker_of(state)
                     conn.execute(
                         "INSERT INTO delivery_items(delivery_id, event_id, "
-                        "lot_id, seller_id, winner_id, picker_id, carrier_id, "
-                        "driver_id, auth_version, delivered_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (delivery_id, event_id, lot["id"],
-                         lot["seller_id"], lot["winner_id"], picker_id,
+                        "lot_id, deal_id, seller_id, winner_id, picker_id, "
+                        "carrier_id, driver_id, auth_version, delivered_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (delivery_id, event_id, lot["id"], deal["id"],
+                         lot["seller_id"], deal["buyer_id"], picker_id,
                          state["carrier_id"], state["driver_id"],
                          state["version"], now),
                     )
@@ -984,6 +1102,8 @@ class PickupMixin:
             "SELECT title FROM lots WHERE id=?", (row["lot_id"],)
         ).fetchone()
         snapshot = {
+            "lot_id": row["lot_id"],
+            "deal_id": row["deal_id"],
             "winner_id": row["winner_id"],
             "carrier_id": row["carrier_id"],
             "driver_id": row["driver_id"],
@@ -993,6 +1113,7 @@ class PickupMixin:
         return {
             "lot_id": row["lot_id"],
             "id": row["lot_id"],
+            "deal_id": row["deal_id"],
             "title": lot["title"] if lot else None,
             "winner": winner,
             "winner_id": row["winner_id"],
@@ -1032,6 +1153,7 @@ class PickupMixin:
         snapshot = [
             {
                 "lot_id": r["lot_id"],
+                "deal_id": r["deal_id"],
                 "winner_id": r["winner_id"],
                 "carrier_id": r["carrier_id"],
                 "driver_id": r["driver_id"],
@@ -1166,7 +1288,9 @@ class PickupMixin:
             _event(conn, event_id)
             actor = _user(conn, event_id, actor_id)
             lot = self._load_batch_lots(conn, event_id, [lot_id])[0]
-            delivered = self._delivered_row(conn, lot_id)
+            deal = self._scoped_deal(conn, event_id, lot, None)
+            delivered = self._delivered_row(
+                conn, lot_id, deal["id"] if deal else None)
             if delivered is None:
                 raise ApiError(404, "receipt_not_found",
                                "Lot has not been delivered yet")

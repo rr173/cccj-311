@@ -31,6 +31,11 @@ CREDENTIAL_LOOKUP = (
     "verification_code", "token",
 )
 
+DEAL_REF_LOOKUP = (
+    "deal_ref", "deal_id", "deal_no", "deal", "sale_id", "sale_no",
+    "transaction_id", "purchase_id",
+)
+
 GENERIC_ACCOUNT_KEYS = (
     "account", "account_ref", "account_name", "user", "user_id", "uid",
     "username", "user_name", "name", "target", "target_id", "to", "to_id",
@@ -58,6 +63,28 @@ def _lot_ids(data: dict) -> list[int]:
     if not ids and isinstance(data.get("lot_id"), int):
         ids = [data["lot_id"]]
     return ids
+
+
+def _deal_ref(data: dict):
+    return first_present(data, DEAL_REF_LOOKUP)
+
+
+def _single_deal_ref(data: dict, one_lot: bool):
+    """Per-item deal ref when the payload supplies an item list, else the
+    single top-level deal ref applied to the whole batch."""
+    for container_key in ("items", "delivery_items", "deliveries",
+                          "lot_items", "lines"):
+        container = data.get(container_key)
+        if isinstance(container, list) and container and all(
+                isinstance(x, dict) for x in container):
+            refs = []
+            for element in container:
+                refs.append(first_present(element, DEAL_REF_LOOKUP))
+            return refs
+    ref = _deal_ref(data)
+    if ref is None:
+        return []
+    return [ref]
 
 
 def register_pickup_routes(app, service, current_user) -> None:
@@ -96,11 +123,18 @@ def register_pickup_routes(app, service, current_user) -> None:
             event_id, user["id"], _lot_ids(data))
 
     # -------------------------------------------------------------- queries
-    def status_endpoint(event_id: int, lot_id: int, user=Auth):
-        return service.pickup_status(event_id, user["id"], lot_id)
+    def status_endpoint(event_id: int, lot_id: int, request: Request,
+                        user=Auth):
+        return service.pickup_status(
+            event_id, user["id"], lot_id,
+            _deal_ref(_merged_payload(None, request)))
 
-    def credential_endpoint(event_id: int, lot_id: int, user=Auth):
-        return service.pickup_credential(event_id, user["id"], lot_id)
+    def credential_endpoint(event_id: int, lot_id: int, request: Request,
+                            payload: Optional[dict] = Body(default=None),
+                            user=Auth):
+        data = _merged_payload(payload, request)
+        return service.pickup_credential(
+            event_id, user["id"], lot_id, _deal_ref(data))
 
     def list_pickups_endpoint(event_id: int, request: Request, user=Auth):
         qp = request.query_params
@@ -115,8 +149,13 @@ def register_pickup_routes(app, service, current_user) -> None:
                                    user=Auth):
         data = _merged_payload(payload, request)
         ids = _lot_ids(data)
-        creds = [service.pickup_credential(event_id, user["id"], lid)
-                 for lid in ids]
+        refs = _single_deal_ref(data, len(ids) == 1)
+        creds = [
+            service.pickup_credential(
+                event_id, user["id"], lid,
+                refs[idx] if idx < len(refs) else None)
+            for idx, lid in enumerate(ids)
+        ]
         by_lot = {str(c["lot_id"]): c["credential"] for c in creds}
         return {
             "event_id": event_id,
@@ -138,6 +177,14 @@ def register_pickup_routes(app, service, current_user) -> None:
                 "verification_code", "token"))
             if cred is not None:
                 items[0]["credential"] = str(cred)
+        # Attach per-item deal references so a lot with revocation history is
+        # addressed explicitly.  Parallel to the item order.
+        refs = _single_deal_ref(data, len(items) == 1)
+        for idx, item in enumerate(items):
+            if item.get("deal_ref") is None and idx < len(refs):
+                item["deal_ref"] = refs[idx]
+        if len(items) == 1 and items[0].get("deal_ref") is None:
+            items[0]["deal_ref"] = _deal_ref(data)
         request_key = extract_request_key(data, request.headers)
         return service.confirm_delivery(
             event_id, seller_id,
@@ -176,6 +223,8 @@ def register_pickup_routes(app, service, current_user) -> None:
                       "credential": None if cred is None else str(cred)}]
         picker_ref = _account(data, PICKER_KEYS)
         request_key = extract_request_key(data, request.headers)
+        if items and items[0].get("deal_ref") is None:
+            items[0]["deal_ref"] = _deal_ref(data)
         receipt, created = service.confirm_delivery(
             event_id, user["id"], request_key=request_key,
             picker_ref=picker_ref, items=items)
@@ -231,6 +280,10 @@ def register_pickup_routes(app, service, current_user) -> None:
                       "create_receipt"}:
             picker_ref = _account(data, PICKER_KEYS)
             items = extract_delivery_items(data)
+            refs = _single_deal_ref(data, len(items) == 1)
+            for idx, item in enumerate(items):
+                if item.get("deal_ref") is None and idx < len(refs):
+                    item["deal_ref"] = refs[idx]
             request_key = extract_request_key(data, request.headers)
             receipt, _ = service.confirm_delivery(
                 event_id, user["id"], request_key=request_key,
@@ -580,7 +633,7 @@ def register_pickup_routes(app, service, current_user) -> None:
                     event_id, request, payload, user)
             if path_lot is not None:
                 return service.pickup_credential(
-                    event_id, user["id"], path_lot)
+                    event_id, user["id"], path_lot, _deal_ref(data))
 
         if seg_has("deliver", "delivery", "handovers", "handover",
                    "confirm-pickup", "confirm") and method == "POST":
@@ -594,6 +647,10 @@ def register_pickup_routes(app, service, current_user) -> None:
                 cred = first_present(data, CREDENTIAL_LOOKUP)
                 items = [{"lot_id": path_lot,
                           "credential": None if cred is None else str(cred)}]
+            refs = _single_deal_ref(data, len(items) == 1)
+            for idx, item in enumerate(items):
+                if item.get("deal_ref") is None and idx < len(refs):
+                    item["deal_ref"] = refs[idx]
             key = extract_request_key(data, request.headers)
             receipt, _ = service.confirm_delivery(
                 event_id, user["id"], request_key=key,
@@ -625,10 +682,24 @@ def register_pickup_routes(app, service, current_user) -> None:
         if path_lot is not None and method == "GET" and seg_has(
                 "pickup", "delivery", "handover", "status", "authorization",
                 "custody", "collection", "delegation"):
-            return service.pickup_status(event_id, user["id"], path_lot)
+            return service.pickup_status(
+                event_id, user["id"], path_lot, _deal_ref(data))
 
         if seg_has("pickups", "my-pickups") and method == "GET":
             return service.list_pickups(event_id, user["id"])
+
+        # Long-tail resale wordings (revoke / offer / accept / deal views).
+        try:
+            from .resale_routes import resale_keyword_dispatch
+
+            resold = resale_keyword_dispatch(
+                service, event_id, rest, method, data, user)
+        except ApiError:
+            raise
+        except Exception:  # pragma: no cover - never mask pickup handling
+            resold = None
+        if resold is not None:
+            return resold
 
         # Long-tail settlement wordings (payments / refunds / payouts / ...).
         # Kept here because this catch-all is the last route registered.

@@ -148,18 +148,22 @@ class SettlementMixin:
 
     def _seller_income(self, conn: sqlite3.Connection, event_id: int,
                        seller_id: int) -> int:
-        """Final prices of lots that are both effectively paid and delivered."""
+        """Final prices of the *effective* sales that are paid and delivered."""
         row = conn.execute(
             """
-            SELECT COALESCE(SUM(l.purchase_price), 0) AS income
-            FROM lots l
-            WHERE l.event_id = ?
+            SELECT COALESCE(SUM(d.price), 0) AS income
+            FROM deals d
+            JOIN lots l ON l.id = d.lot_id
+            WHERE d.event_id = ?
               AND l.seller_id = ?
-              AND l.winner_id IS NOT NULL
+              AND d.status = 'active'
               AND EXISTS (SELECT 1 FROM delivery_items di
-                          WHERE di.lot_id = l.id)
+                          WHERE di.lot_id = d.lot_id
+                            AND di.deal_id = d.id)
               AND EXISTS (SELECT 1 FROM payment_items pi
-                          WHERE pi.lot_id = l.id AND pi.active = 1)
+                          WHERE pi.lot_id = d.lot_id
+                            AND pi.deal_id = d.id
+                            AND pi.active = 1)
             """,
             (event_id, seller_id),
         ).fetchone()
@@ -237,6 +241,7 @@ class SettlementMixin:
             item_payload.append({
                 "lot_id": it["lot_id"],
                 "id": it["lot_id"],
+                "deal_id": it["deal_id"],
                 "title": lot_row["title"] if lot_row else None,
                 "seller_id": it["seller_id"],
                 "winner_id": it["winner_id"],
@@ -372,17 +377,19 @@ class SettlementMixin:
                              seller_id: int) -> list[dict]:
         rows = conn.execute(
             """
-            SELECT l.id AS lot_id, l.title, l.purchase_price AS price,
-                   l.winner_id,
+            SELECT l.id AS lot_id, l.title, d.id AS deal_id, d.deal_no,
+                   d.price AS price, d.buyer_id AS winner_id,
                    (SELECT pi.serial_no FROM payment_items pi
-                     WHERE pi.lot_id=l.id AND pi.active=1) AS serial_no,
+                     WHERE pi.lot_id=l.id AND pi.deal_id=d.id AND pi.active=1)
+                     AS serial_no,
                    EXISTS (SELECT 1 FROM delivery_items di
-                           WHERE di.lot_id=l.id) AS delivered,
+                           WHERE di.lot_id=l.id AND di.deal_id=d.id) AS delivered,
                    EXISTS (SELECT 1 FROM payment_items pi
-                           WHERE pi.lot_id=l.id AND pi.active=1) AS paid
-            FROM lots l
-            WHERE l.event_id=? AND l.seller_id=? AND l.winner_id IS NOT NULL
-            ORDER BY l.id
+                           WHERE pi.lot_id=l.id AND pi.deal_id=d.id
+                             AND pi.active=1) AS paid
+            FROM deals d JOIN lots l ON l.id=d.lot_id
+            WHERE d.event_id=? AND l.seller_id=? AND d.status='active'
+            ORDER BY d.id
             """,
             (event_id, seller_id),
         ).fetchall()
@@ -393,6 +400,8 @@ class SettlementMixin:
             out.append({
                 "lot_id": r["lot_id"],
                 "id": r["lot_id"],
+                "deal_id": r["deal_id"],
+                "deal_no": r["deal_no"],
                 "title": r["title"],
                 "purchase_price": r["price"],
                 "price": r["price"],
@@ -660,6 +669,7 @@ class SettlementMixin:
     def register_payment(self, event_id: int, actor_id: int,
                          serial_no: Any = None, buyer_ref: Any = None,
                          amount: Any = None, lot_ids: Sequence[Any] | None = None,
+                         deal_refs: Sequence[Any] | None = None,
                          **kwargs: Any) -> tuple[dict, bool]:
         # Tolerate alternative keyword names from direct service callers.
         if serial_no is None:
@@ -683,6 +693,10 @@ class SettlementMixin:
                 or kwargs.get("lot_id_list") or [])
         if isinstance(lot_ids, (int, str)):
             lot_ids = [lot_ids]
+        if deal_refs is None:
+            deal_refs = kwargs.get("deal_ref") or kwargs.get("deals") or []
+        if deal_refs is not None and not isinstance(deal_refs, (list, tuple)):
+            deal_refs = [deal_refs]
 
         serial = str(serial_no or "").strip()
         if not serial:
@@ -696,6 +710,18 @@ class SettlementMixin:
             raise ApiError(422, "invalid_amount",
                            "Amount must be a non-negative integer")
         ids = parse_distinct_lot_ids(list(lot_ids or []))
+        # Optional per-lot deal references (parallel to lot_ids, or one deal
+        # applying to the whole single-lot receipt).
+        deal_ids_per_lot: dict[int, Any] = {}
+        dr = list(deal_refs or [])
+        if dr:
+            for idx, ref in enumerate(dr):
+                if ref is None:
+                    continue
+                if idx < len(ids):
+                    deal_ids_per_lot[ids[idx]] = ref
+                elif len(ids) == 1:
+                    deal_ids_per_lot[ids[0]] = ref
 
         with self.db.tx() as conn:
             _event(conn, event_id)
@@ -721,23 +747,30 @@ class SettlementMixin:
                 return payload, False
 
             lots = self._load_event_lots(conn, event_id, ids)
+            totals: list[tuple[sqlite3.Row, sqlite3.Row]] = []
             total = 0
             for lot in lots:
-                if lot["winner_id"] is None:
+                deal_ref = deal_ids_per_lot.get(lot["id"])
+                deal = self._payment_deal(conn, event_id, lot, deal_ref)
+                if deal is None:
                     raise ApiError(409, "lot_not_sold",
                                    "Every lot in a payment must be sold")
-                if lot["winner_id"] != buyer_id:
+                if deal["status"] != "active":
+                    raise ApiError(409, "deal_revoked",
+                                   "A lot in this payment has a revoked sale")
+                if deal["buyer_id"] != buyer_id:
                     raise ApiError(
                         409, "lot_not_won_by_buyer",
-                        "Every lot in a payment must have been won by the "
-                        "paying buyer in this event",
+                        "Every lot in a payment must belong to the paying "
+                        "buyer's effective sale in this event",
                     )
                 if self._active_payment_item(conn, lot["id"]) is not None:
                     raise ApiError(
                         409, "lot_already_paid",
                         "A lot in this group already has an effective receipt",
                     )
-                total += int(lot["purchase_price"])
+                total += int(deal["price"])
+                totals.append((lot, deal))
 
             if amount_int != total:
                 raise ApiError(
@@ -756,14 +789,15 @@ class SettlementMixin:
                      len(ids), actor_id, now),
                 )
                 payment_id = cur.lastrowid
-                for lot in lots:
+                for lot, deal in totals:
                     conn.execute(
                         "INSERT INTO payment_items(payment_id, event_id, "
-                        "serial_no, lot_id, seller_id, winner_id, amount, "
-                        "active, created_at) VALUES (?,?,?,?,?,?,?,1,?)",
+                        "serial_no, lot_id, deal_id, seller_id, winner_id, "
+                        "amount, active, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,1,?)",
                         (payment_id, event_id, serial, lot["id"],
-                         lot["seller_id"], lot["winner_id"],
-                         int(lot["purchase_price"]), now),
+                         deal["id"], lot["seller_id"], deal["buyer_id"],
+                         int(deal["price"]), now),
                     )
             except sqlite3.IntegrityError as exc:
                 # Racing process inserted an active allocation first.
@@ -781,6 +815,35 @@ class SettlementMixin:
             payload["replayed"] = False
             payload["idempotent_replay"] = False
             return payload, True
+
+    def _payment_deal(self, conn: sqlite3.Connection, event_id: int,
+                      lot: sqlite3.Row, deal_ref: Any) -> sqlite3.Row | None:
+        """Resolve the sale a receipt line pays for.
+
+        Explicit deal references must belong to this lot; without one the
+        effective deal is used, but only while the lot has no revocation
+        history.  After a revoke the caller must name the deal, so a legacy
+        lot-only receipt can never be applied to the new buyer's sale.
+        """
+        from .resales import active_deal_for_lot, lot_has_revoked_deal, \
+            resolve_deal_ref
+
+        if deal_ref is not None:
+            deal = resolve_deal_ref(conn, event_id, deal_ref)
+            if deal["lot_id"] != lot["id"]:
+                raise ApiError(409, "deal_lot_mismatch",
+                               "The referenced deal belongs to a different lot")
+            return deal
+        active = active_deal_for_lot(conn, lot["id"])
+        if active is None:
+            return None
+        if lot_has_revoked_deal(conn, lot["id"]):
+            raise ApiError(
+                409, "deal_reference_required",
+                "This lot has a revoked sale; specify which deal the receipt "
+                "pays for (deal_id/deal_no)",
+            )
+        return active
 
     # Friendly aliases for direct service-level callers.
     def create_payment(self, *a, **k):

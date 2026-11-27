@@ -42,6 +42,7 @@ from .models import (
 )
 from .service import Service
 from .pickup_routes import register_pickup_routes
+from .resale_routes import register_resale_routes
 from .settlement_routes import register_settlement_routes
 
 DB_PATH = os.environ.get(
@@ -211,6 +212,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     # Registered before the pickup routes so the pickup keyword catch-all does
     # not shadow the explicit settlement endpoints.
     register_settlement_routes(app, service, current_user)
+
+    # --- sale revocation / directed re-sale ("撤销成交 / 定向补售") ---------
+    # Explicit deal/offer endpoints are registered before the pickup catch-all.
+    register_resale_routes(app, service, current_user)
 
     # --- post-sale pickup / delivery ("交割 / 领货") ------------------------
     register_pickup_routes(app, service, current_user)
