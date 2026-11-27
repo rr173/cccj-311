@@ -159,15 +159,68 @@ python3 -m pytest -q
 - 公开接口 `GET /events/{id}`、`/lots`、`/lots/{lot}` 的响应结构**未加入**任何交割字段，不泄露凭据、承运人或司机身份。
 - 新表 `pickup_auth / deliveries / delivery_items` 与拍卖数据在同一个 SQLite 文件；`delivery_items.lot_id UNIQUE` 是防重复交付的硬约束。重启后授权、回执、凭据（同一 HMAC 密钥）均保留。旧库的 `users` 角色 CHECK 会在启动时无损迁移以支持 `carrier/driver` 角色。
 
+## 线下成交款结算（Offline Settlement）
+
+活动管理员按银行回单登记**收款**与**退票**；卖家只能对**同时存在有效收款与已确认交割回执**的拍品申请打款。服务只记账，不连接任何银行或支付平台；**活动关闭后仍可办理**。本功能不修改赢家、成交价、预算或已有交割回执。
+
+### 记账规则
+
+- **收款登记**（管理员）：`流水号 + 付款买家 + 金额 + 一组互不重复拍品`，可跨多个卖家。所有拍品必须：本场被该买家赢得、当前没有有效收款；金额必须等于这些拍品 `purchase_price` 之和。任一条不满足则**整组不变**（单事务）。
+- **流水号幂等**：同一 `(活动, 流水号)` 重报相同内容（拍品顺序无关，按排序 id 规范化哈希）返回原记录（资源路由首次 `201`、重放 `200` 且 `replayed:true`）；内容不同返回 `409 idempotency_conflict`。
+- **退票**：管理员按流水号整笔退票。只停用**该流水自己的**收款分配，因此重复退票绝不会撤掉后来用**新流水**做的补缴；重复退票幂等返回原退票记录。
+- **可结算收入**：每件拍品在「存在 `active=1` 的收款分配」且「存在 `delivery_items` 交割记录」时，按成交价计入其卖家收入；两个条件谁先成立都行（收入为状态推导，天然不重复计）。
+- **打款申请**：卖家以 `request_id`（同活动+卖家唯一）申请**正整数**金额；`可申请额度 = max(0, 收入 − 已打款 − 待打款占用)`。同 `request_id` 重送同金额返回原申请，改金额 `409`。
+- **确认 / 释放**：管理员可把待打款申请置为 `paid`（已打款）或 `released`（释放占用）；同动作重复执行幂等且不重复记账；对已取消/已释放的申请确认会被 `409` 拒绝。
+- **退票重平衡**：退票撤掉对应收入但不撤销已打款。若 `收入 − 已打款` 不足以覆盖待打款，则按申请 id（成立先后）**从最新起整单取消**，直到剩余待打款被覆盖；当已打款 > 剩余收入时取消全部待打款，`待抵扣差额 = max(0, 已打款 − 收入)`，由该卖家日后新增收入自动先抵扣（额度公式 `max(0, 收入 − 已打款 − 待打款)` 已内含这一优先抵扣）。一笔退票跨多卖家时，各卖家的重平衡在**同一事务**一起生效。
+- **并发**：收款、交割、退票、打款、确认/释放都在同一把进程内 `RLock` + SQLite `BEGIN IMMEDIATE` 事务内串行；`payment_items(lot_id) WHERE active=1` 部分唯一索引与 `payouts(活动,卖家,request_key)` 唯一约束是跨进程硬保护。结果等价于某个实际生效顺序。
+- **隐私**：收款/退票/全量打款记录仅管理员；卖家只能看自己的额度与申请状态、或按 id/请求号查自己的申请；其他人（含买家、其他卖家）返回 `403/404`，未认证 `401`。公开拍卖接口响应不含任何结算字段。所有新表与拍卖数据同库，重启后记录与额度（全部由持久状态推导）保持一致。
+
+### 主要接口（规范路径，另挂载大量命名别名）
+
+| 方法 | 路径 | 身份 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/events/{id}/payments` | 管理员 | 登记收款（资源型，首 `201`/重放 `200`） |
+| GET | `/events/{id}/payments` | 管理员 | 本场收款记录（`?status=valid\|refunded`） |
+| GET | `/events/{id}/payments/{serial_or_pk}` | 管理员 | 单笔收款 |
+| POST | `/events/{id}/refunds` | 管理员 | 按 `serial_no` 退票（首 `201`/重退 `200`） |
+| POST | `/events/{id}/payments/{serial}/refund` | 管理员 | 动作型退票（始终 `200`） |
+| GET | `/events/{id}/refunds` | 管理员 | 退票记录 |
+| POST | `/events/{id}/payouts` | 卖家 | 申请打款（首 `201`/重放 `200`） |
+| GET | `/events/{id}/payouts` | 卖家(自己)/管理员(全部) | 打款申请与状态，支持 `?status=&request_id=&seller_id=` |
+| GET/PATCH | `/events/{id}/payouts/{pk_or_request_id}` | 卖家本人/管理员 | 申请详情；PATCH `{"status":"paid"\|"released"\|"cancelled"}` |
+| POST | `/events/{id}/payouts/{pid}/confirm` | 管理员 | 确认已打款（重复确认幂等） |
+| POST | `/events/{id}/payouts/{pid}/release` | 管理员 | 释放待打款占用（重复释放幂等） |
+| POST | `/events/{id}/payouts/{pid}/cancel` | 管理员 | 取消申请（释放占用） |
+| GET | `/events/{id}/settlement` | 卖家 | 自己的额度视图（含 `available_amount/pending_amount/paid_amount/deficit_amount/settled_income` 与 `payouts`） |
+| GET | `/events/{id}/sellers/{seller_id}/settlement` | 管理员 | 指定卖家额度 |
+| GET | `/events/{id}/settlement/records` | 管理员 | 收款/退票/打款三合一核对 |
+
+收款请求示例：
+
+```json
+{
+  "serial_no": "ICBC20261127001",
+  "buyer_id": 7,
+  "amount": 1230,
+  "lot_ids": [11, 12, 13]
+}
+```
+
+打款申请示例：`{"request_id":"seller-a-po-0001","amount":500}`（也支持 `Idempotency-Key` 头）。
+
+为适配不同命名习惯，同一能力还挂载在 `/bank-receipts`、`/bank-payments`、`/remittances`、`/refund`、`/bounces`、`/chargebacks`、`/withdrawals`、`/withdraw`、`/cash-out(s)`、`/payout-requests`、`/my-payouts`、`/balance`、`/earnings`、`/income`、`/wallet`、`/my-settlement`、`/settlements/me`、`/settleable-lots`、`/admin/*` 以及拼音 `/shoukuan|tuipiao|dakuan|jiesuan` 等路径；字段兼容 `bank_serial(_no)`、`transaction_no`、`payer_id`、`reference(_no)`、`request_no` 等大量别名，并兼容 camelCase / 中划线 / 下划线与中文字段名。
+
 ## 代码结构
 
 ```
 app/
   domain.py        纯规则：领先者、当前价、预算占用（无 DB / 无 HTTP）
   db.py            SQLite schema、连接、串行化写事务、角色约束迁移
-  service.py       业务编排（校验、状态迁移、审计日志），继承 PickupMixin
+  service.py       业务编排（校验、状态迁移、审计日志），继承 PickupMixin / SettlementMixin
   pickups.py       领货/交割规则、凭据 HMAC、幂等哈希、回执与批量事务
   pickup_routes.py 领货/交割 HTTP 路由 + 多命名别名与宽松字段解析
+  settlements.py   线下收款/退票/可结算收入/打款额度与退票重平衡规则（SettlementMixin）
+  settlement_routes.py 结算 HTTP 路由 + 大量路径/字段别名与关键词兜底
   main.py          FastAPI 路由工厂 create_app()
   models.py        Pydantic 请求/响应模型（金额字段 strict int）
   errors.py        ApiError → {"error": {...}}

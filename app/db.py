@@ -153,6 +153,102 @@ CREATE INDEX IF NOT EXISTS idx_delivery_items_picker
     ON delivery_items(event_id, picker_id);
 CREATE INDEX IF NOT EXISTS idx_delivery_items_seller
     ON delivery_items(event_id, seller_id);
+
+-- ---------------------------------------------------------------------------
+-- Offline settlement ("线下成交款结算")
+--
+-- The service only keeps the books: an admin records bank receipts
+-- (payments) and bounces/refunds them; sellers request payouts against income
+-- that is both effectively paid AND delivered.  Nothing here talks to a bank.
+--
+-- One bank serial number is one payment registration within an event
+-- (idempotency boundary for re-reporting the same receipt).
+CREATE TABLE IF NOT EXISTS payments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id     INTEGER NOT NULL REFERENCES events(id),
+    serial_no    TEXT    NOT NULL,
+    buyer_id     INTEGER NOT NULL REFERENCES users(id),
+    amount       INTEGER NOT NULL CHECK (amount >= 0),
+    status       TEXT    NOT NULL DEFAULT 'valid'
+                 CHECK (status IN ('valid', 'refunded')),
+    request_hash TEXT    NOT NULL DEFAULT '',
+    lot_count    INTEGER NOT NULL DEFAULT 0,
+    created_by   INTEGER REFERENCES users(id),
+    created_at   TEXT    NOT NULL,
+    refunded_at  TEXT,
+    refund_id    INTEGER,
+    UNIQUE(event_id, serial_no)
+);
+
+-- Every lot covered by a payment is preserved as history, even after refund.
+-- ``active = 1`` marks the allocation of the currently effective payment;
+-- the partial unique index is the hard guarantee that a lot has at most one
+-- effective receipt at a time, even across racing processes.
+CREATE TABLE IF NOT EXISTS payment_items (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL REFERENCES payments(id),
+    event_id   INTEGER NOT NULL REFERENCES events(id),
+    serial_no  TEXT    NOT NULL DEFAULT '',
+    lot_id     INTEGER NOT NULL REFERENCES lots(id),
+    seller_id  INTEGER NOT NULL REFERENCES users(id),
+    winner_id  INTEGER NOT NULL REFERENCES users(id),
+    amount     INTEGER NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT    NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_items_active_lot
+    ON payment_items(lot_id) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_payment_items_payment
+    ON payment_items(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payment_items_event_lot
+    ON payment_items(event_id, lot_id);
+CREATE INDEX IF NOT EXISTS idx_payment_items_seller
+    ON payment_items(event_id, seller_id, active);
+CREATE INDEX IF NOT EXISTS idx_payment_items_active
+    ON payment_items(event_id, active);
+
+-- One refund/bounce record per bank serial (duplicate refunds replay this).
+CREATE TABLE IF NOT EXISTS refunds (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER NOT NULL REFERENCES events(id),
+    refund_no   TEXT    NOT NULL,
+    serial_no   TEXT    NOT NULL,
+    payment_id  INTEGER NOT NULL REFERENCES payments(id),
+    operator_id INTEGER REFERENCES users(id),
+    reason      TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL,
+    UNIQUE(event_id, serial_no)
+);
+
+-- Seller payout applications.  (event, seller, request_key) is the seller's
+-- idempotency boundary.  status:
+--   pending   - occupies the available quota ("待打款占用")
+--   paid      - admin confirmed the bank transfer ("已打款")
+--   released  - admin released a still-pending application (hold freed)
+--   cancelled - whole-order cancellation by the refund re-balancing, or an
+--               administrative cancel (hold freed)
+CREATE TABLE IF NOT EXISTS payouts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      INTEGER NOT NULL REFERENCES events(id),
+    seller_id     INTEGER NOT NULL REFERENCES users(id),
+    request_key   TEXT    NOT NULL,
+    amount        INTEGER NOT NULL CHECK (amount > 0),
+    status        TEXT    NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'paid', 'released',
+                                    'cancelled')),
+    cancel_reason TEXT    NOT NULL DEFAULT '',
+    created_by    INTEGER REFERENCES users(id),
+    operator_id   INTEGER REFERENCES users(id),
+    created_at    TEXT    NOT NULL,
+    decided_at    TEXT,
+    UNIQUE(event_id, seller_id, request_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_payouts_seller_status
+    ON payouts(event_id, seller_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_payouts_event_status
+    ON payouts(event_id, status, id);
 """
 
 # Roles accepted by newer builds.  The users table may already exist with the
@@ -166,6 +262,21 @@ class Database:
         self.path = path or DB_PATH
         self._lock = threading.RLock()
         self._alias_secret: str | None = None
+        self._ready = False
+
+    def ensure_ready(self) -> None:
+        """Idempotent schema initialisation, performed lazily on first use.
+
+        This keeps plain ``TestClient(app)`` instances (which do not run the
+        lifespan context) and direct service usage working without an explicit
+        ``init()`` call.
+        """
+        if self._ready:
+            return
+        with self._lock:
+            if not self._ready:
+                self.init()
+                self._ready = True
 
     def init(self) -> None:
         conn = self.connect()
@@ -195,6 +306,7 @@ class Database:
             self._alias_secret = row["value"]
         finally:
             conn.close()
+        self._ready = True
 
     @staticmethod
     def _migrate_users_role(conn: sqlite3.Connection) -> None:
@@ -262,6 +374,7 @@ class Database:
     def read(self) -> Iterator[sqlite3.Connection]:
         """A deferred transaction gives multi-statement reads one consistent
         snapshot under WAL, so a view never mixes pre- and post-bid state."""
+        self.ensure_ready()
         conn = self.connect()
         try:
             conn.execute("BEGIN DEFERRED")
@@ -274,6 +387,7 @@ class Database:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
+        self.ensure_ready()
         with self._lock:
             conn = self.connect()
             try:

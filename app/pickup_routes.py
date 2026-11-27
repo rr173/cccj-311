@@ -630,6 +630,20 @@ def register_pickup_routes(app, service, current_user) -> None:
         if seg_has("pickups", "my-pickups") and method == "GET":
             return service.list_pickups(event_id, user["id"])
 
+        # Long-tail settlement wordings (payments / refunds / payouts / ...).
+        # Kept here because this catch-all is the last route registered.
+        try:
+            from .settlement_routes import settlement_keyword_dispatch
+
+            settled = settlement_keyword_dispatch(
+                service, event_id, rest, method, data, user)
+        except ApiError:
+            raise
+        except Exception:  # pragma: no cover - never mask pickup handling
+            settled = None
+        if settled is not None:
+            return settled
+
         raise ApiError(404, "not_found", "Unknown pickup endpoint")
 
     app.add_api_route(
